@@ -1,0 +1,53 @@
+[project]
+name = "llm-archive"
+version = "0.0.1"
+description = "One local searchable archive of LLM sessions across chat sites and CLI coding agents"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Semantic (and therefore hybrid) search. Without it `llma index --no-vectors`
+# and keyword-only search still work.
+embed = [
+    "fastembed>=0.4",
+]
+# Phase 0 only: embedding model benchmark (tools/bench_embed.py).
+bench = [
+    "fastembed>=0.4",
+]
+web = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "markdown-it-py>=3.0",
+    "python-multipart>=0.0.9",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+llma = "llm_archive.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_archive"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Pinned explicitly rather than left to ruff's default, which widens between
+# releases: 0.16 turned a clean tree into 144 findings without a line changing.
+# A documented `ruff check .` that fails on a fresh clone is worse than no lint.
+select = ["E4", "E7", "E9", "F"]

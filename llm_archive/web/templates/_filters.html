@@ -1,0 +1,89 @@
+<aside class="filters">
+  <div class="fgroup">
+    <h3>Source</h3>
+    {% for s in facets.sources %}
+      <label class="check">
+        <input type="checkbox" name="source" value="{{ s.kind }}"
+               {% if s.kind in selected_sources %}checked{% endif %}>
+        <span>{{ s.label }}</span><b>{{ s.n }}</b>
+      </label>
+    {% endfor %}
+  </div>
+
+  {% if facets.participants %}
+  <div class="fgroup">
+    <h3>Assistant</h3>
+    <select name="participant">
+      <option value="">any assistant</option>
+      {% for pt in facets.participants %}
+        <option value="{{ pt.key }}" {% if pt.key == participant %}selected{% endif %}>
+          {{ pt.label }} ({{ pt.n }})
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
+
+  <div class="fgroup">
+    <h3>Project</h3>
+    <select name="workspace">
+      <option value="">any project</option>
+      {% for w in facets.workspaces %}
+        <option value="{{ w.label }}" {% if w.label == workspace %}selected{% endif %}>
+          {{ w.label }} ({{ w.n }})
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+
+  {% if facets.hosts|length > 1 %}
+  <div class="fgroup">
+    <h3>Machine</h3>
+    <select name="host">
+      <option value="">any machine</option>
+      {% for h in facets.hosts %}
+        <option value="{{ h.h }}" {% if h.h == host %}selected{% endif %}>
+          {{ h.h }} ({{ h.n }})
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
+
+  {% if facets.tags %}
+  <div class="fgroup">
+    <h3>Tag</h3>
+    <select name="tag">
+      <option value="">any tag</option>
+      {% for t in facets.tags %}
+        <option value="{{ t.name }}" {% if t.name == tag %}selected{% endif %}>
+          {{ t.name }} ({{ t.n }})
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
+
+  <div class="fgroup">
+    <h3>Date</h3>
+    <label class="date">from <input type="date" name="since" value="{{ since }}"></label>
+    <label class="date">to <input type="date" name="until" value="{{ until }}"></label>
+  </div>
+
+  <div class="fgroup">
+    <h3>Retrieval</h3>
+    {% for m, blurb in [('hybrid','keyword + meaning'), ('semantic','meaning only'), ('keyword','exact words')] %}
+      <label class="check">
+        <input type="radio" name="mode" value="{{ m }}" {% if mode == m %}checked{% endif %}>
+        <span>{{ m }}</span><i>{{ blurb }}</i>
+      </label>
+    {% endfor %}
+    <label class="check" title="Turns abandoned by a rewind or prompt edit. Real history, just not what happened.">
+      <input type="checkbox" name="abandoned" value="true" {% if abandoned %}checked{% endif %}>
+      <span>abandoned branches</span>
+    </label>
+  </div>
+
+  <button type="submit" class="apply">Apply</button>
+  <a class="clear" href="{{ request.url.path }}">Clear all</a>
+</aside>

@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}Browse — Session Archive{% endblock %}
+
+{% block body %}
+<form class="layout" method="get" action="/browse">
+  <aside class="filters">
+    <div class="fgroup">
+      <h3>Source</h3>
+      <select name="source">
+        <option value="">any source</option>
+        {% for s in facets.sources %}
+          <option value="{{ s.kind }}" {% if s.kind == source %}selected{% endif %}>
+            {{ s.label }} ({{ s.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    {% if facets.participants %}
+    <div class="fgroup">
+      <h3>Assistant</h3>
+      <select name="participant">
+        <option value="">any assistant</option>
+        {% for pt in facets.participants %}
+          <option value="{{ pt.key }}" {% if pt.key == participant %}selected{% endif %}>
+            {{ pt.label }} ({{ pt.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    <div class="fgroup">
+      <h3>Project</h3>
+      <select name="workspace">
+        <option value="">any project</option>
+        {% for w in facets.workspaces %}
+          <option value="{{ w.label }}" {% if w.label == workspace %}selected{% endif %}>
+            {{ w.label }} ({{ w.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    {% if facets.hosts|length > 1 %}
+    <div class="fgroup">
+      <h3>Machine</h3>
+      <select name="host">
+        <option value="">any machine</option>
+        {% for h in facets.hosts %}
+          <option value="{{ h.h }}" {% if h.h == host %}selected{% endif %}>
+            {{ h.h }} ({{ h.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    {% if facets.tags %}
+    <div class="fgroup">
+      <h3>Tag</h3>
+      <select name="tag">
+        <option value="">any tag</option>
+        {% for t in facets.tags %}
+          <option value="{{ t.name }}" {% if t.name == tag %}selected{% endif %}>
+            {{ t.name }} ({{ t.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    {% if facets.model_types %}
+    <div class="fgroup">
+      <h3>Model type</h3>
+      <select name="model_type">
+        <option value="">any type</option>
+        {% for mt in facets.model_types %}
+          <option value="{{ mt.type }}" {% if mt.type == model_type %}selected{% endif %}>
+            {{ mt.type }} ({{ mt.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    <button type="submit" class="apply">Apply</button>
+    <a class="clear" href="/browse">Clear all</a>
+  </aside>
+
+  <main>
+    {% set qs = "source=" ~ source ~ "&participant=" ~ participant ~ "&workspace=" ~ workspace ~ "&host=" ~ host ~ "&tag=" ~ tag ~ "&model_type=" ~ model_type %}
+    <p class="meta">{{ "{:,}".format(count) }} sessions, newest first
+      {% if count %}·
+        <a href="/export?{{ qs }}" title="every session matching these filters, as a zip">
+          export all {{ "{:,}".format(count) }}
+        </a>
+      {% endif %}
+    </p>
+    <table class="grid">
+      <thead>
+        <tr><th>Session</th><th>Source</th><th>Model</th><th>Project</th><th>Machine</th>
+            <th class="num">Msgs</th><th>Date</th></tr>
+      </thead>
+      <tbody>
+        {% for item in rows %}
+          <tr>
+            <td><a href="/session/{{ item.r.id }}">{{ item.r.title or "(untitled)" }}</a></td>
+            <td><span class="chip src-{{ item.r.source_kind }}">{{ item.r.source_kind }}</span>
+                {% if item.r.participant %}<span class="chip">{{ item.r.participant }}</span>{% endif %}</td>
+            <td>{{ item.r.model_primary or "—" }}
+                {% if item.model_type %}<span class="tag type-{{ item.model_type }}">{{ item.model_type }}</span>{% endif %}</td>
+            <td>{{ item.r.workspace or "—" }}</td>
+            <td>{{ item.r.host or "—" }}</td>
+            <td class="num">{{ item.r.msg_count }}</td>
+            <td class="num">{{ item.when }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if count > limit %}
+      <nav class="pager">
+        {% set qs = "source=" ~ source ~ "&participant=" ~ participant ~ "&workspace=" ~ workspace ~ "&host=" ~ host ~ "&tag=" ~ tag ~ "&model_type=" ~ model_type %}
+        {% if offset > 0 %}
+          <a href="/browse?{{ qs }}&offset={{ [offset - limit, 0]|max }}">← previous</a>
+        {% endif %}
+        <span>{{ offset + 1 }}–{{ [offset + limit, count]|min }} of {{ count }}</span>
+        {% if offset + limit < count %}
+          <a href="/browse?{{ qs }}&offset={{ offset + limit }}">next →</a>
+        {% endif %}
+      </nav>
+    {% endif %}
+  </main>
+</form>
+{% endblock %}

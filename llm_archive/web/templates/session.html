@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}{{ meta.title or "Session" }} — Archive{% endblock %}
+
+{% block body %}
+<div class="reader">
+  <div class="rhead">
+    <h1>{{ meta.title or "(untitled)" }}</h1>
+    <div class="hit-meta">
+      <span class="chip src-{{ meta.source_kind }}">{{ meta.source_label }}</span>
+      {% if meta.participant %}<span class="chip">{{ meta.participant }}</span>{% endif %}
+      <span>{{ when }}</span>
+      {% if meta.workspace %}<span>· {{ meta.workspace }}</span>{% endif %}
+      {% if meta.host %}<span>· {{ meta.host }}</span>{% endif %}
+      {% if meta.model_primary %}<span>· {{ meta.model_primary }}</span>
+        {% if model_type %}<span class="tag type-{{ model_type }}">{{ model_type }}</span>{% endif %}
+      {% endif %}
+    </div>
+
+    <div class="rstats">
+      <span>{{ dag.total }} messages</span>
+      {% if dag.abandoned %}
+        <span title="Turns left behind by a rewind or prompt edit — kept, but not what happened">
+          {{ dag.abandoned }} abandoned
+        </span>
+      {% endif %}
+      {% if dag.sidechain %}<span>{{ dag.sidechain }} subagent</span>{% endif %}
+      {% if meta.tok_out %}<span>{{ "{:,}".format(meta.tok_out) }} out</span>{% endif %}
+      {% if meta.tok_cache_read %}
+        <span>{{ "{:,}".format(meta.tok_cache_read) }} cache-read</span>
+      {% endif %}
+    </div>
+
+    <div class="rtools">
+      {% set base = "/session/" ~ meta.id ~ "?q=" ~ (q|urlencode) %}
+      <a href="{{ base }}&tools={{ 'false' if tools else 'true' }}&abandoned={{ 'true' if abandoned else 'false' }}">
+        {{ "hide" if tools else "show" }} tool calls
+      </a>
+      <a href="{{ base }}&tools={{ 'true' if tools else 'false' }}&abandoned={{ 'false' if abandoned else 'true' }}">
+        {{ "hide" if abandoned else "show" }} abandoned branches
+      </a>
+      <a href="/session/{{ meta.id }}/export.html?download=true" title="self-contained HTML, opens without this server">
+        export HTML
+      </a>
+      <a href="/session/{{ meta.id }}/export.md" title="plain Markdown, secrets redacted">
+        export Markdown
+      </a>
+      <a href="#" class="share-link" data-prompt="{{ share_prompt_json }}"
+         title="copies a ready-to-paste request for Claude to publish this session as a shared link">
+        export link
+      </a>
+      <span class="path" title="the file this was parsed from">{{ meta.raw_path }}</span>
+    </div>
+
+    <form class="tagbar" method="post" action="/session/{{ meta.id }}/tag">
+      {% for t in tags %}
+        <span class="tag">
+          {{ t }}
+          <button form="untag-{{ loop.index }}" title="remove">×</button>
+        </span>
+      {% endfor %}
+      <input name="name" list="alltags" placeholder="add tag…" autocomplete="off">
+      <datalist id="alltags">
+        {% for t in all_tags %}<option value="{{ t.name }}">{% endfor %}
+      </datalist>
+      <button type="submit">+</button>
+    </form>
+    {% for t in tags %}
+      <form id="untag-{{ loop.index }}" method="post"
+            action="/session/{{ meta.id }}/untag" class="hidden">
+        <input type="hidden" name="name" value="{{ t }}">
+      </form>
+    {% endfor %}
+  </div>
+
+  <div class="thread">
+    {% for m in messages %}
+      <div class="msg role-{{ m.row.role }}
+                  {% if not m.row.on_active_path %}dead{% endif %}
+                  {% if m.row.is_sidechain %}side{% endif %}">
+        <div class="mhead">
+          <b>{{ m.row.role }}</b>
+          {% if m.row.is_sidechain %}<span class="badge">subagent</span>{% endif %}
+          {% if not m.row.on_active_path %}<span class="badge warn">abandoned</span>{% endif %}
+          <span class="when">{{ m.when }}</span>
+          <span class="msave">
+            <a href="/session/{{ meta.id }}/message/{{ m.row.id }}/export.md?tools={{ 'true' if tools else 'false' }}"
+               title="save just this message as Markdown, secrets redacted">md</a>
+            <a href="/session/{{ meta.id }}/message/{{ m.row.id }}/export.html?tools={{ 'true' if tools else 'false' }}"
+               title="save just this message as a self-contained HTML file">html</a>
+          </span>
+        </div>
+
+        {% for p in m.parts %}
+          {% if p.kind in ("text", "thinking") %}
+            <div class="part {{ p.kind }}">
+              {% if p.kind == "thinking" %}<span class="plabel">thinking</span>{% endif %}
+              <div class="body md{{ ' clip' if p.big }}">{{ p.html|safe }}</div>
+            </div>
+          {% elif p.kind == "image" and p.sha %}
+            <figure class="part image">
+              <a href="/blob/{{ p.sha }}" target="_blank" rel="noopener"
+                 title="open full size">
+                <img src="/blob/{{ p.sha }}" loading="lazy"
+                     alt="{{ p.caption or 'image' }}">
+              </a>
+              <figcaption>
+                {% if p.caption %}<span class="fname">{{ p.caption }}</span>{% endif %}
+                <span class="tsize">{{ (p.bytes / 1024)|round(1) }} KB</span>
+              </figcaption>
+            </figure>
+          {% elif p.kind == "image" %}
+            <div class="part image missing">
+              <span class="plabel">image not stored</span>
+              {% if p.caption %}<span class="fname">{{ p.caption }}</span>{% endif %}
+              {% if p.ref_url %}
+                <span class="hint">referenced by URL — run
+                  <code>llma fetch-images</code> to pull it into the archive</span>
+              {% else %}
+                <span class="hint">the export shipped no bytes for this one</span>
+              {% endif %}
+            </div>
+          {% else %}
+            <details class="part tool">
+              <summary>
+                <span class="tname">{{ p.tool_name or p.kind }}</span>
+                <span class="tkind">{{ p.kind.replace('_', ' ') }}</span>
+                {% if p.tool_ok == 0 %}<span class="badge warn">error</span>{% endif %}
+                {% if p.has_blob %}<span class="badge">offloaded</span>{% endif %}
+                {% if p.duration %}<span class="tduration">{{ p.duration }}</span>{% endif %}
+                <span class="tsize">{{ (p.bytes / 1024)|round(1) }} KB</span>
+                {% if p.sha %}
+                  <a class="dl" href="/blob/{{ p.sha }}?download=true"
+                     title="save the stored bytes">save</a>
+                {% endif %}
+              </summary>
+              <div class="body{{ ' md' if p.md }}{{ ' clip' if p.big }}">{{ p.html|safe }}</div>
+            </details>
+          {% endif %}
+        {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
+
+  {% if total > page %}
+    <nav class="pager">
+      {% if offset > 0 %}
+        <a href="/session/{{ meta.id }}?offset={{ [offset - page, 0]|max }}&q={{ q|urlencode }}&tools={{ 'true' if tools else 'false' }}">← previous</a>
+      {% endif %}
+      <span>{{ offset + 1 }}–{{ [offset + page, total]|min }} of {{ total }}</span>
+      {% if offset + page < total %}
+        <a href="/session/{{ meta.id }}?offset={{ offset + page }}&q={{ q|urlencode }}&tools={{ 'true' if tools else 'false' }}">next →</a>
+      {% endif %}
+    </nav>
+  {% endif %}
+</div>
+
+<script>
+// The only script on this page: there's no server-side "publish", since the tool that
+// turns a file into a shared link only exists inside a Claude agent session. So this
+// copies the ask instead of a URL, for pasting into one.
+(function () {
+  var link = document.querySelector(".share-link");
+  if (!link || !navigator.clipboard) return;
+  var label = link.textContent;
+  link.addEventListener("click", function (ev) {
+    ev.preventDefault();
+    navigator.clipboard.writeText(JSON.parse(link.dataset.prompt)).then(function () {
+      link.textContent = "copied — paste into Claude Code";
+      setTimeout(function () { link.textContent = label; }, 2500);
+    });
+  });
+})();
+</script>
+{% endblock %}

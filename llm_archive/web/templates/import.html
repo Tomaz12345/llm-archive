@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% block title %}Import — Session Archive{% endblock %}
+
+{% block body %}
+<div class="dash">
+
+  {# One page, both halves of "how do I add data?": drop a file you have, and see which
+     exports you still owe. Splitting those means the answer to "what should I go and
+     download?" lives on a page you only visit once you already know. #}
+  <section class="panel">
+    <h2>Add an export</h2>
+    <p class="sub">
+      Drop a file here, or pick one. Exports are identified by their contents, not their
+      names — Grok's is a bare uuid, Mistral's is a timestamp — so you do not have to
+      know which is which. Re-adding one you already hold does nothing.
+    </p>
+    <form method="post" action="/import" enctype="multipart/form-data" id="dropform">
+      <label class="dropzone" id="dropzone">
+        <input type="file" name="upload" id="fileinput" multiple hidden>
+        <span class="dz-main">Drop export files here</span>
+        <span class="dz-sub">or click to choose · .zip, .json, .har, .html</span>
+        <span class="dz-picked" id="picked"></span>
+      </label>
+      <button type="submit" class="btn-primary">Import</button>
+    </form>
+    <p class="sub" style="margin-top:10px">
+      Or from a terminal: <code>llma add ~/Downloads</code> — same identification, and it
+      leaves your originals where they are.
+    </p>
+  </section>
+
+  {% if error %}<section class="panel"><p class="warn-line">{{ error }}</p></section>{% endif %}
+
+  {% if taken %}
+  <section class="panel">
+    <h2>Just now</h2>
+    <div class="scrollx">
+      <table class="grid">
+        <thead><tr><th>File</th><th>Identified as</th><th>Result</th></tr></thead>
+        <tbody>
+        {% for t in taken %}
+          <tr>
+            <td>{{ t.source.name }}</td>
+            <td>{% if t.kind %}<span class="chip src-{{ t.kind }}">{{ t.kind }}</span>
+                {% else %}<span class="muted">—</span>{% endif %}</td>
+            <td>{{ t.action }}{% if t.detail %} <span class="muted">({{ t.detail }})</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if results %}
+  <section class="panel">
+    <h2>Ingest</h2>
+    <div class="scrollx">
+      <table class="grid">
+        <thead><tr>
+          <th>Source</th><th class="num">New</th><th class="num">Updated</th>
+          <th class="num">Appended</th><th class="num">Retained</th>
+          <th class="num">Skipped</th><th class="num">Stale</th><th class="num">Messages</th>
+        </tr></thead>
+        <tbody>
+        {% for row in results %}
+          <tr>
+            <td>{{ row.label }}</td>
+            <td class="num">{{ row.r.new }}</td>
+            <td class="num">{{ row.r.updated }}</td>
+            <td class="num">{{ row.r.appended }}</td>
+            <td class="num">{{ row.r.retained }}</td>
+            <td class="num">{{ row.r.skipped }}</td>
+            <td class="num">{{ row.r.stale }}</td>
+            <td class="num">{{ "{:,}".format(row.r.messages) }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="sub" style="margin-top:10px">
+      New sessions are stored but not yet searchable — ingest renumbers part ids, so run
+      <code>llma index</code> (or <code>llma sync</code>) to rebuild the indexes.
+    </p>
+  </section>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Still to fetch</h2>
+    <p class="sub">
+      {{ summary.needs_action }} source(s) need attention. Live local stores are re-read
+      on every ingest and never go stale; per-chat sources are listed but never nagged,
+      because no single action makes them current.
+    </p>
+    <div class="scrollx">
+      <table class="grid">
+        <thead><tr>
+          <th>Source</th><th>State</th><th class="num">Sessions</th>
+          <th>Why</th><th>Where the export button is</th>
+        </tr></thead>
+        <tbody>
+        {% for f in freshness %}
+          <tr>
+            <td>{{ f.label }}</td>
+            <td>
+              <span class="badge {% if f.state in ('missing', 'overdue') %}warn{% endif %}">
+                {{ f.state }}
+              </span>
+            </td>
+            <td class="num">{{ "{:,}".format(f.sessions) }}</td>
+            <td>
+              {{ f.reason }}
+              {% if f.idle %}<div class="muted">{{ f.idle }}</div>{% endif %}
+              {% if f.retention %}<div class="muted">{{ f.retention }}</div>{% endif %}
+            </td>
+            <td class="muted">
+              {{ f.how }}
+              {% if f.note %}<div>{{ f.note }}</div>{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Drops held</h2>
+    <p class="sub">
+      Every file the archive has taken in, keyed by content hash — which is how the same
+      export downloaded twice under two names is recognised as one. A drop moves to
+      <code>drops/_archive/</code> once its sessions are stored; the raw bytes stay so a
+      session can always be re-parsed from the file it came from.
+      {% if passed_over %}
+        {{ passed_over }} other file(s) were looked at and were not exports — recorded
+        so a repeat scan does not open them again.
+      {% endif %}
+    </p>
+    {% if drops %}
+    <div class="scrollx">
+      <table class="grid">
+        <thead><tr>
+          <th>File</th><th>Source</th><th>Exported</th>
+          <th class="num">Size</th><th class="num">Sessions</th><th>State</th>
+        </tr></thead>
+        <tbody>
+        {% for d in drops %}
+          <tr>
+            <td>{{ d.r.name }}</td>
+            <td><span class="chip src-{{ d.r.kind }}">{{ d.r.kind }}</span></td>
+            <td>{{ d.when }}</td>
+            <td class="num">{{ "{:,}".format(d.r.bytes // 1024) }} KB</td>
+            <td class="num">{% if d.r.sessions %}{{ d.r.sessions }}{% else %}—{% endif %}</td>
+            <td>{% if d.archived %}archived{% elif d.r.ingested_at %}ingested{% else %}pending{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <p class="hint muted">Nothing taken in yet. Drop an export above, or run
+        <code>llma add ~/Downloads</code>.</p>
+    {% endif %}
+  </section>
+
+</div>
+
+<script>
+// Progressive enhancement only: without it the label still opens the file picker and
+// the form still posts. Nothing here is required for the page to work.
+(function () {
+  var zone = document.getElementById('dropzone');
+  var input = document.getElementById('fileinput');
+  var picked = document.getElementById('picked');
+  if (!zone || !input) return;
+
+  function show() {
+    var n = input.files ? input.files.length : 0;
+    picked.textContent = n === 0 ? '' :
+      (n === 1 ? input.files[0].name : n + ' files selected');
+  }
+  input.addEventListener('change', show);
+
+  ['dragenter', 'dragover'].forEach(function (e) {
+    zone.addEventListener(e, function (ev) {
+      ev.preventDefault(); zone.classList.add('over');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (e) {
+    zone.addEventListener(e, function (ev) {
+      ev.preventDefault(); zone.classList.remove('over');
+    });
+  });
+  zone.addEventListener('drop', function (ev) {
+    if (ev.dataTransfer && ev.dataTransfer.files.length) {
+      input.files = ev.dataTransfer.files;
+      show();
+    }
+  });
+})();
+</script>
+{% endblock %}

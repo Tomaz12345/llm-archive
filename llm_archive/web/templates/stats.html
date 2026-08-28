@@ -1,0 +1,402 @@
+{% extends "base.html" %}
+{% block title %}Stats — Session Archive{% endblock %}
+
+{% block body %}
+<div class="dash">
+
+  <section class="tiles">
+    <div class="tile">
+      <dt>Sessions</dt>
+      <dd>{{ "{:,}".format(d.overview.sessions) }}</dd>
+      <small>{{ d.overview.sources }} sources · {{ d.overview.hosts }} machines</small>
+    </div>
+    <div class="tile">
+      <dt>Messages</dt>
+      <dd>{{ "{:,}".format(d.overview.messages) }}</dd>
+      <small>{{ "{:,}".format(d.overview.abandoned) }} abandoned, excluded</small>
+    </div>
+    <div class="tile">
+      <dt>Turns</dt>
+      <dd>{{ "{:,}".format(d.overview.turns) }}</dd>
+      <small>{{ "{:,}".format(d.overview.tool_steps) }} tool steps not counted</small>
+    </div>
+    <div class="tile">
+      <dt>Cache reads</dt>
+      <dd>{{ "%.2f"|format(d.overview.cache_read / 1e9) }}B</dd>
+      <small>vs {{ "%.1f"|format(d.overview.tok_out / 1e6) }}M generated</small>
+    </div>
+    <div class="tile accent">
+      <dt>List-price value</dt>
+      <dd>${{ "{:,.0f}".format(d.cost_total_billed) }}</dd>
+      <small>not what you paid — see below</small>
+    </div>
+  </section>
+
+  <p class="caveat">
+    <b>What the dollar figure is.</b> It prices your token volume at published API
+    rates. Most of this was not billed that way: Claude Code here runs on a
+    subscription, <code>copilot/*</code> is covered by GitHub Copilot, and
+    <code>:free</code> endpoints cost nothing. Read it as
+    <i>what this volume would list for</i> — good for comparing months, projects and
+    models against each other, misleading as money that left your account.
+    Cache reads price at 0.1× input and cache writes at 1.25×; with
+    {{ "%.2f"|format(d.overview.cache_read / 1e9) }}B cache-read tokens that
+    distinction is worth roughly
+    ${{ "{:,.0f}".format(d.overview.cache_read / 1e6 * 5 * 0.9) }} on its own.
+  </p>
+
+  <!-- ---------------------------------------------------------------- -->
+  <section class="panel">
+    <h2>Sessions per month</h2>
+    <p class="sub">Stacked by source. {{ d.volume.months|length }} months of history.</p>
+    <div class="scrollx">{{ chart_volume|safe }}</div>
+    {{ legend_volume|safe }}
+  </section>
+
+  <section class="panel">
+    <h2>Messages per month</h2>
+    <p class="sub">Stacked by source. {{ d.messages_volume.months|length }} months of history.</p>
+    <div class="scrollx">{{ chart_messages_volume|safe }}</div>
+    {{ legend_messages_volume|safe }}
+  </section>
+
+  <section class="panel">
+    <h2>Where you work</h2>
+    <p class="sub">The same sessions by surface rather than by tool: a terminal, a chat
+      panel inside the editor, or a browser. Several tools share each one.</p>
+    <div class="scrollx">{{ chart_surface|safe }}</div>
+    {{ legend_surface|safe }}
+  </section>
+
+  <section class="panel">
+    <h2>Cumulative messages</h2>
+    <p class="sub">Everything you have ever said to a model, and it back to you.</p>
+    <div class="scrollx">{{ chart_cumulative|safe }}</div>
+  </section>
+
+  <section class="panel">
+    <h2>When you work</h2>
+    <p class="sub">Messages by weekday and hour (UTC). Darker is busier; peak
+      {{ d.heatmap.peak }} messages in one cell.</p>
+    <div class="scrollx">{{ chart_heatmap|safe }}</div>
+  </section>
+
+  <div class="two">
+    <section class="panel">
+      <h2>Tool calls</h2>
+      <p class="sub">Across every agent.
+        {% if d.tool_outcomes.total %}
+          {{ "%.1f"|format(d.tool_outcomes.pct) }}% of results reported an error.
+        {% endif %}
+        {% if d.tool_duration.timed_calls %}
+          {{ fmt_ms(d.tool_duration.total_ms) }} spent waiting on tools
+          ({{ "%.1f"|format(d.tool_duration.coverage_pct) }}% of calls timed,
+          avg {{ fmt_ms(d.tool_duration.avg_ms|round|int) }}, longest
+          {{ fmt_ms(d.tool_duration.max_ms) }}) — Claude Code, Codex and opencode
+          timestamp both ends; other sources don't.
+        {% endif %}
+      </p>
+      <div class="scrollx">{{ chart_tools|safe }}</div>
+      {{ legend_tools|safe }}
+      {% if d.tools and d.tools|selectattr("timed_calls")|list %}
+        <table class="grid">
+          <thead><tr>
+            <th>tool</th><th>calls</th><th>timed</th><th>avg</th><th>total</th>
+          </tr></thead>
+          <tbody>
+            {% for t in d.tools if t.timed_calls %}
+              <tr>
+                <td>{{ t.name }}</td>
+                <td class="num">{{ "{:,}".format(t.calls) }}</td>
+                <td class="num">{{ "{:,}".format(t.timed_calls) }}</td>
+                <td class="num">{{ fmt_ms(t.avg_ms|round|int) }}</td>
+                <td class="num">{{ fmt_ms(t.total_ms) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Busiest projects</h2>
+      <p class="sub">By turn count.</p>
+      <div class="scrollx">{{ chart_workspaces|safe }}</div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Session length</h2>
+    <p class="sub">How many <b>turns</b> a session runs to — tool calls excluded, so an
+      agent session and a chat session are measured the same way. <code>0</code> is a
+      session that is nothing but tool traffic.</p>
+    <div class="scrollx">{{ chart_shape|safe }}</div>
+  </section>
+
+  <!-- Relief for the light-mode contrast WARN: the numbers behind every chart. -->
+  <section class="panel">
+    <h2>Models and estimated value</h2>
+    <p class="sub">The table is the authoritative view — chart colors alone are not
+      relied on to convey any of this.
+      {% if d.models_unrecorded.sessions %}
+        Rows marked <span class="badge warn">no model recorded</span> are
+        <b>not models</b>: Gemini, Mistral, claude.ai and part of VS Code chat export
+        no model on any record, so those
+        {{ "{:,}".format(d.models_unrecorded.sessions) }} sessions are labelled by
+        whoever answered instead. They are never priced — an app name is not a rate.
+      {% endif %}</p>
+    <div class="scrollx">
+      <table class="grid">
+        <thead>
+          <tr><th>Model</th><th>Type</th><th class="num">Sessions</th><th class="num">Turns</th>
+              <th class="num">Messages</th>
+              <th class="num">In</th><th class="num">Out</th>
+              <th class="num">Cache read</th><th class="num">List value</th>
+              <th>Billing</th></tr>
+        </thead>
+        <tbody>
+          {% for m in d.models %}
+            <tr>
+              <td>{{ m.model }}{% if not m.verified and m.reason == 'list price' %}
+                    <span class="badge warn" title="rate not verified">est</span>{% endif %}
+                  {%- if not m.model_recorded %}
+                    <span class="badge warn"
+                          title="the export records no model; this is who answered"
+                          >no model recorded</span>{% endif %}</td>
+              <td>{% if m.type %}<span class="tag type-{{ m.type }}">{{ m.type }}</span>{% endif %}</td>
+              <td class="num">{{ m.sessions }}</td>
+              <td class="num">{{ "{:,}".format(m.turns) }}</td>
+              <td class="num">{{ "{:,}".format(m.messages) }}</td>
+              <td class="num">{{ "{:,}".format(m.tok_in) }}</td>
+              <td class="num">{{ "{:,}".format(m.tok_out) }}</td>
+              <td class="num">{{ "{:,}".format(m.cache_read) }}</td>
+              <td class="num">{% if m.usd %}${{ "{:,.2f}".format(m.usd) }}{% else %}—{% endif %}</td>
+              <td>{% if m.billed %}<span class="badge">metered</span>
+                  {% else %}<span class="tag">{{ m.reason }}</span>{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="two">
+    <section class="panel">
+      <h2>By source</h2>
+      <p class="sub">Compare on turns. Messages are not comparable between sources:
+        an agent files every tool call and result as its own message, a chat app folds
+        them into the reply.</p>
+      <table class="grid">
+        <thead><tr><th>Source</th><th class="num">Sessions</th>
+                   <th class="num">Turns</th><th class="num">Messages</th>
+                   <th class="num">Cache read</th></tr></thead>
+        <tbody>
+          {% for s in d.sources %}
+            <tr><td>{{ s.label }}</td>
+                <td class="num">{{ s.sessions }}</td>
+                <td class="num">{{ "{:,}".format(s.turns) }}</td>
+                <td class="num">{{ "{:,}".format(s.messages) }}</td>
+                <td class="num">{{ "{:,}".format(s.cache_read) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>By machine</h2>
+      <table class="grid">
+        <thead><tr><th>Machine</th><th class="num">Sessions</th>
+                   <th class="num">Turns</th><th class="num">Messages</th></tr></thead>
+        <tbody>
+          {% for h in d.hosts %}
+            <tr><td>{{ h.host }}</td><td class="num">{{ h.sessions }}</td>
+                <td class="num">{{ "{:,}".format(h.turns) }}</td>
+                <td class="num">{{ "{:,}".format(h.messages) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  {% if d.participants %}
+  <section class="panel">
+    <h2>By assistant</h2>
+    <p class="sub">Where one store is shared by several chat extensions.</p>
+    <table class="grid">
+      <thead><tr><th>Assistant</th><th>Source</th><th class="num">Sessions</th>
+                 <th class="num">Messages</th></tr></thead>
+      <tbody>
+        {% for pt in d.participants %}
+          <tr><td>{{ pt.label }}</td><td>{{ pt.source }}</td>
+              <td class="num">{{ pt.sessions }}</td>
+              <td class="num">{{ "{:,}".format(pt.messages) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  <section class="panel">
+    <h2>What the archive stores</h2>
+    <p class="sub">Only a fraction is worth embedding — tool output is searchable by
+      keyword but never vectorised.</p>
+    <table class="grid">
+      <thead><tr><th>Kind</th><th class="num">Parts</th><th class="num">Stored</th>
+                 <th class="num">Embedded</th></tr></thead>
+      <tbody>
+        {% for c in d.content %}
+          <tr><td>{{ c.kind }}</td>
+              <td class="num">{{ "{:,}".format(c.parts) }}</td>
+              <td class="num">{{ "%.1f"|format(c.bytes / 1e6) }} MB</td>
+              <td class="num">{% if c.embedded %}{{ "%.2f"|format(c.embedded / 1e6) }} MB
+                  {% else %}—{% endif %}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Search index</h2>
+    <p class="sub">Ingesting rewrites a session's parts and their ids move with them.
+      Both indexes are keyed on those ids, and neither complains when they go stale —
+      keyword search starts matching the wrong rows, and vector search stops seeing the
+      re-ingested sessions. Rebuild with <code>llma index</code> after every ingest.</p>
+
+    {% set ix = d.index %}
+    {% if ix.state == 'fresh' %}
+      <p class="fresh"><b>Up to date.</b> Built
+        {{ fmt_when(ix.last.finished_at, true) }}, nothing ingested since.</p>
+    {% elif ix.state == 'stale' %}
+      <p class="stale"><b>Out of date.</b> Built
+        {{ fmt_when(ix.last.finished_at, true) }} — {{ ix.reasons|join('; ') }}.</p>
+    {% elif ix.state == 'never' %}
+      <p class="stale"><b>Never built.</b> Search will return nothing.</p>
+    {% else %}
+      <p class="sub"><b>Unknown.</b> This archive was last indexed before builds were
+        recorded. The next <code>llma index</code> will start dating them.</p>
+    {% endif %}
+
+    {% for note in ix.notes %}
+      <p class="sub">{{ note }}.</p>
+    {% endfor %}
+
+    {% if ix.last %}
+      <table class="grid">
+        <thead><tr><th>Built</th><th class="num">Keyword rows</th>
+                   <th class="num">Chunks</th><th class="num">Vectors</th>
+                   <th>Model</th><th class="num">Took</th></tr></thead>
+        <tbody>
+          <tr><td>{{ fmt_when(ix.last.finished_at, true) }}</td>
+              <td class="num">{{ "{:,}".format(ix.last.fts_rows) }}</td>
+              <td class="num">{{ "{:,}".format(ix.last.chunks) }}</td>
+              <td class="num">{% if ix.last.with_vectors %}{{ "{:,}".format(ix.last.vectors) }}
+                  {% else %}skipped{% endif %}</td>
+              <td>{{ ix.last.model_tag or "—" }}</td>
+              <td class="num">{{ "{:,.0f}".format(ix.last.seconds or 0) }}s</td></tr>
+        </tbody>
+      </table>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Export freshness</h2>
+    <p class="sub">Only bulk-export sources can be nagged about: one request refreshes
+      the whole account there. Local stores are re-read on every ingest, and per-chat
+      sources are one manual file per conversation, so neither is ranked. A source
+      whose export stopped arriving does not look broken on the charts above — it just
+      goes quiet, which is indistinguishable from a slow month.</p>
+
+    {% set fresh_rows = d.freshness | selectattr('mode', 'equalto', 'bulk') | list %}
+    {% set action = fresh_rows | rejectattr('state', 'in', ['current']) | list %}
+    {% if action %}
+      <p class="stale"><b>{{ action|length }} export(s) want attention.</b>
+        {{ action | map(attribute='label') | join(', ') }}.</p>
+    {% else %}
+      <p class="fresh"><b>All bulk exports are current.</b></p>
+    {% endif %}
+
+    <table class="grid">
+      <thead><tr><th>Source</th><th class="num">Sessions</th>
+                 <th class="num">Exported</th><th>State</th><th>Where</th></tr></thead>
+      <tbody>
+        {% for r in fresh_rows %}
+          <tr><td>{{ r.label }}</td>
+              <td class="num">{{ "{:,}".format(r.sessions) }}</td>
+              <td class="num">{% if r.export_age_days is none %}never
+                  {% else %}{{ "%.0f"|format(r.export_age_days) }}d ago{% endif %}</td>
+              <td>{{ r.state }}</td>
+              <td>{{ r.how }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% set retention = d.freshness | selectattr('retention') | list %}
+    {% for r in retention %}
+      <p class="sub" style="margin-top:8px"><b>{{ r.label }}</b> — {{ r.retention }}.</p>
+    {% endfor %}
+  </section>
+
+  <section class="panel">
+    <h2>Secrets</h2>
+    <p class="sub">Ten sources concentrated into one searchable file is the most
+      valuable thing on this laptop (§8.6). Redaction rewrites <code>part.text</code>
+      only — the originals under <code>raw_path</code> still hold the plaintext and
+      ingest re-reads them, which is why it is a stored setting rather than a one-off
+      command. Blobs and <code>data/drops/</code> are not covered by it.</p>
+
+    {% set red = d.redaction %}
+    {% if red.enabled %}
+      <p class="fresh"><b>On.</b> Applied on every ingest
+        ({{ 'wide' if red.wide else 'default' }} rules) —
+        {{ "{:,}".format(red.rows) }} redaction(s) so far,
+        {{ red.distinct }} distinct secret(s) across
+        {{ red.sessions }} session(s).</p>
+    {% else %}
+      <p class="sub"><b>Off.</b> Nothing is being redacted. Preview what it would find
+        with <code>llma redact</code>, then <code>llma redact --apply --enable</code>.</p>
+    {% endif %}
+
+    {% if red.by_rule %}
+      <table class="grid">
+        <thead><tr><th>Rule</th><th class="num">Redactions</th>
+                   <th class="num">Distinct secrets</th></tr></thead>
+        <tbody>
+          {% for r in red.by_rule %}
+            <tr><td>{{ r.rule }}</td>
+                <td class="num">{{ "{:,}".format(r.n) }}</td>
+                <td class="num">{{ r.k }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Ingest health</h2>
+    <p class="sub">Format drift shows up here first — an adapter that stops
+      recognising a record type counts it rather than failing.</p>
+    <table class="grid">
+      <thead><tr><th>Source</th><th>When</th><th class="num">New</th>
+                 <th class="num">Updated</th><th class="num">Skipped</th></tr></thead>
+      <tbody>
+        {% for r in d.hygiene.runs %}
+          <tr><td>{{ r.source_kind }}</td>
+              <td class="num">{{ fmt_when(r.finished_at, true) }}</td>
+              <td class="num">{{ r.sessions_new }}</td>
+              <td class="num">{{ r.sessions_updated }}</td>
+              <td class="num">{{ r.sessions_skipped }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% set cov = d.hygiene.pricing_coverage %}
+    <p class="sub" style="margin-top:10px">
+      Pricing coverage: {{ cov.priced }} sessions priced,
+      {{ cov.free + cov.subscription }} unmetered,
+      {{ cov.unpriced }} with no model recorded
+      {%- if cov.missing_models %} — unknown models:
+        {{ cov.missing_models|join(', ') }}{% endif %}.
+    </p>
+  </section>
+
+</div>
+{% endblock %}

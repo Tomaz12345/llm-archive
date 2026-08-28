@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{% if q %}{{ q }} — {% endif %}Session Archive{% endblock %}
+
+{% block body %}
+<form class="layout" method="get" action="/">
+  {% include "_filters.html" %}
+
+  <main>
+    <div class="searchbar">
+      <input type="search" name="q" value="{{ q }}" autofocus
+             placeholder="the chat where I worked out the offside thing…">
+      <button type="submit">Search</button>
+    </div>
+
+    {% if error %}
+      <p class="error">Search failed — {{ error }}</p>
+    {% endif %}
+
+    {% if index.state == 'stale' %}
+      <p class="stale">
+        <b>Search index is out of date.</b>
+        Built {{ fmt_when(index.last.finished_at, true) }} —
+        {{ index.reasons|join('; ') }}.
+        Results below can be wrong, not merely incomplete: keyword matches are looked up
+        by row id, and those move when a session is re-ingested.
+        Run <code>llma index</code> to rebuild.
+      </p>
+    {% elif index.state == 'never' %}
+      <p class="stale">
+        <b>No search index yet.</b> Run <code>llma index</code> to build one.
+      </p>
+    {% endif %}
+
+    {% if q and not error %}
+      <p class="meta">
+        {{ hits|length }} session{{ '' if hits|length == 1 else 's' }}
+        in {{ '%.0f'|format(elapsed * 1000) }} ms · {{ mode }}
+        {% if mode != 'keyword' and totals.chunks == 0 %}
+          — <b>no vectors built</b>, run <code>llma index</code>
+        {% endif %}
+      </p>
+    {% endif %}
+
+    {% for item in hits %}
+      {% set h = item.hit %}
+      <article class="hit">
+        <a class="hit-title" href="/session/{{ h.session_id }}?q={{ q|urlencode }}">
+          {{ h.title or "(untitled)" }}
+        </a>
+        <div class="hit-meta">
+          <span class="chip src-{{ h.source }}">{{ h.source }}</span>
+          <span>{{ item.when }}</span>
+          {% if h.workspace %}<span>· {{ h.workspace }}</span>{% endif %}
+          {% if h.host %}<span>· {{ h.host }}</span>{% endif %}
+          <span class="match match-{{ h.matched_by }}" title="which retriever found it">
+            {{ h.matched_by }}
+          </span>
+          {% for t in item.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+        </div>
+        {% for s in item.snippets %}
+          <p class="snippet"><span class="role">{{ s.role }}</span>{{ s.html|safe }}</p>
+        {% endfor %}
+      </article>
+    {% endfor %}
+
+    {% if q and not hits and not error %}
+      <div class="empty">
+        <p>Nothing matched.</p>
+        <p class="hint">
+          Try <b>semantic</b> retrieval if you are describing the chat rather than quoting it,
+          or <b>keyword</b> if you remember an exact command or error — tool output is
+          searchable by keyword only.
+        </p>
+      </div>
+    {% elif not q %}
+      <div class="empty">
+        <p>Search {{ "{:,}".format(totals.messages) }} messages across every tool and machine.</p>
+        <p class="hint">
+          Describe it in your own words — hybrid retrieval does not need the words you
+          originally used. Exact strings from commands and errors work too.
+        </p>
+      </div>
+    {% endif %}
+  </main>
+</form>
+{% endblock %}

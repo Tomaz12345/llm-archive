@@ -1,0 +1,29 @@
+# R6 — the archive is the highest-value secret on this machine.
+# data/ holds chat logs, tool output, API keys that leaked into them, and the
+# search index built from all of it. It must never reach a remote.
+data/
+
+# Also never commit anything copied out of the source stores.
+*.jsonl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.npy
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

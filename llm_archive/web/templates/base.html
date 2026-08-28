@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Session Archive{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css?v={{ asset_v }}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🗄️</text></svg>">
+</head>
+<body class="{% if request.url.path.startswith('/session/') %}page-reader{% elif request.url.path == '/stats' %}page-dash{% else %}page-layout{% endif %}">
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">Session&nbsp;Archive</a>
+    <nav>
+      <a href="/" class="{% if request.url.path == '/' %}on{% endif %}">Search</a>
+      <a href="/browse" class="{% if request.url.path == '/browse' %}on{% endif %}">Browse</a>
+      <a href="/stats" class="{% if request.url.path == '/stats' %}on{% endif %}">Stats</a>
+      <a href="/import" class="{% if request.url.path == '/import' %}on{% endif %}">Import</a>
+    </nav>
+    <span class="totals">
+      {{ "{:,}".format(totals.sessions) }} sessions ·
+      {{ "{:,}".format(totals.messages) }} messages ·
+      {{ "{:,}".format(totals.chunks) }} chunks
+    </span>
+  </div>
+</header>
+
+{% block body %}{% endblock %}
+
+<footer class="foot">
+  local only · 127.0.0.1 · this database holds credentials that leaked into tool output —
+  do not expose it
+</footer>
+</body>
+</html>
