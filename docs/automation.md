@@ -230,6 +230,50 @@ archive unsearchable indefinitely. The coverage question is asked through
 `search.selection`, the same module `/stats` reports staleness with, so the two can
 never disagree about what "indexed" means.
 
+### Starting the web UI at logon
+
+`llma schedule` builds the nightly *sync* task. The UI is a separate, long-running
+process, so it gets its own task — registered by hand, from
+`tools/serve_windowless.py`:
+
+| | |
+|---|---|
+| task | `LLM Archive Serve` |
+| trigger | at logon, `Delay PT1M` — the archive should not compete with the login storm |
+| runs | `.venv\Scripts\pythonw.exe tools\serve_windowless.py` |
+| log | `data/serve.log`, same front-truncation as `sync.log` |
+
+Two settings are load-bearing, and both were found by the task failing silently:
+
+* **`ExecutionTimeLimit` must be `PT0S`** (unlimited). The default is three days, after
+  which the scheduler would kill a perfectly healthy server.
+* **`Priority` must be 5, not the 7 the sync task uses.** 7 is `BELOW_NORMAL`, and on a
+  machine with a browser and an editor open that starves the startup imports badly
+  enough to look like a hang: `llm_archive.web.app` alone took **31 seconds** to import,
+  and the process sat at 0.6s of CPU for four minutes without ever binding the port. At
+  priority 5 the same task serves in **30 seconds**. Below-normal is right for a nightly
+  batch job nobody is waiting on; it is wrong for the thing you are about to open.
+
+`MultipleInstancesPolicy` stays `IgnoreNew`, so a second logon cannot start a second
+server against the same port — but note the trap it sets during debugging: while an
+instance is stuck, `Start-ScheduledTask` is silently a no-op, which reads exactly like
+the task refusing to run.
+
+**Why a launcher script and not `pythonw -m llm_archive.cli serve`.** That form exits 1
+before it binds anything. pythonw gives the process no console, so `sys.stdout` and
+`sys.stderr` are `None`, and uvicorn's logging config calls `sys.stderr.isatty()` while
+deciding whether to colourise. The nightly sync gets away with pythonw only because
+`sync --log` writes through `core.sync.logger` and never builds a logging config.
+`tools/serve_windowless.py` points both streams at `data/serve.log` first, which fixes
+the crash and means a failed start — a port already taken is the likely one — leaves a
+traceback instead of an exit code and nothing.
+
+```
+schtasks /Run /TN "LLM Archive Serve"      # start it now
+Get-ScheduledTask "LLM Archive Serve" | Get-ScheduledTaskInfo
+Unregister-ScheduledTask "LLM Archive Serve" -Confirm:$false
+```
+
 ### Other platforms
 
 `llma schedule` is Windows-only and says so. The equivalent is a crontab line:
