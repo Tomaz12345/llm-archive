@@ -64,6 +64,20 @@
   </div>
   {% endif %}
 
+  {% if facets.model_types %}
+  <div class="fgroup">
+    <h3>Model type</h3>
+    <select name="model_type">
+      <option value="">any type</option>
+      {% for mt in facets.model_types %}
+        <option value="{{ mt.type }}" {% if mt.type == model_type %}selected{% endif %}>
+          {{ mt.type }} ({{ mt.n }})
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
+
   <div class="fgroup">
     <h3>Date</h3>
     <label class="date">from <input type="date" name="since" value="{{ since }}"></label>
