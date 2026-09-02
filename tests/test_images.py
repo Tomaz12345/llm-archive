@@ -309,3 +309,156 @@ def test_fetched_image_then_shows_up_in_the_page(archive):
     body = TestClient(create_app(data)).get("/session/1").text
     assert body.count("<img src=\"/blob/") == 2
     assert "image not stored" in body      # the one with no URL at all still says so
+
+
+# ------------------------------------------------- the backfill `serve` runs at start
+
+def test_start_backfill_fetches_and_the_page_then_shows_the_image(archive):
+    """The whole point: start the server, the picture is there without typing anything."""
+    data, con, _, sha = archive
+    con.close()
+
+    thread = fetch_images.backfill_on_start(
+        data / "archive.db", data / "blobs", echo=lambda line: None,
+        fetch=lambda url: JPEG)
+    assert thread is not None
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    body = TestClient(create_app(data)).get("/session/1").text
+    assert body.count('<img src="/blob/') == 2
+
+
+def test_start_backfill_opens_no_socket_when_nothing_is_pending(archive):
+    """The short circuit that makes this tolerable on every single start."""
+    data, con, blobs, _ = archive
+    fetch_images.run(con, blobs, fetch=lambda url: JPEG)
+    con.close()
+
+    thread = fetch_images.backfill_on_start(
+        data / "archive.db", data / "blobs", echo=lambda line: None,
+        fetch=lambda url: pytest.fail("reached the network with nothing to fetch"))
+    assert thread is None
+
+
+def test_start_backfill_survives_a_failure_instead_of_killing_serve(archive):
+    data, con, _, _ = archive
+    con.close()
+    lines: list[str] = []
+
+    def boom(url):
+        raise OSError("no route to host")
+
+    thread = fetch_images.backfill_on_start(
+        data / "archive.db", data / "blobs", echo=lines.append, fetch=boom)
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    # and the page still renders, with the honest placeholder it had before
+    assert "image not stored" in TestClient(create_app(data)).get("/session/1").text
+
+
+def test_start_backfill_runs_as_a_daemon(archive):
+    """A slow CDN must not be the reason Ctrl-C does not exit."""
+    data, con, _, _ = archive
+    con.close()
+    thread = fetch_images.backfill_on_start(
+        data / "archive.db", data / "blobs", echo=lambda line: None,
+        fetch=lambda url: JPEG)
+    assert thread.daemon
+    thread.join(timeout=10)
+
+
+def test_lifespan_starts_the_backfill(archive, monkeypatch):
+    """Wired to the app's start, not just callable on its own."""
+    data, con, _, _ = archive
+    con.close()
+    calls: list[tuple] = []
+    monkeypatch.setattr(fetch_images, "backfill_on_start",
+                        lambda *a, **kw: calls.append(a) or None)
+
+    with TestClient(create_app(data)):
+        pass
+    assert calls and calls[0][0] == data / "archive.db"
+
+
+def test_no_fetch_images_keeps_the_server_offline(archive, monkeypatch):
+    data, con, _, _ = archive
+    con.close()
+    monkeypatch.setattr(fetch_images, "backfill_on_start",
+                        lambda *a, **kw: pytest.fail("backfill ran despite the opt-out"))
+
+    with TestClient(create_app(data, fetch_images=False)):
+        pass
+
+
+# ------------------------------------------------------------ the give-up guard
+
+def test_run_gives_up_after_a_run_of_failures(tmp_path):
+    """A laptop whose network is not up at logon must not spend TIMEOUT per candidate."""
+    data = tmp_path / "data"
+    data.mkdir()
+    con = db.connect(data / "archive.db")
+    blobs = BlobStore(data / "blobs")
+    src = db.source_id(con, "t3chat", "T3 Chat", "web")
+    messages = [
+        Message(native_id=f"m{i}", role="assistant", created_at=1771200000000 + i, seq=i,
+                parts=[Part(kind=KIND_IMAGE, seq=0, bytes=118,
+                            text=f"gen{i}.jpg https://cdn.example/f/{i}")])
+        for i in range(10)
+    ]
+    db.upsert_session(con, src, Session(
+        source_kind="t3chat", native_id="t2", title="many", workspace_key=None,
+        workspace_label=None, started_at=1771200000000, raw_path="/raw/x",
+        raw_hash="t2", messages=messages))
+    con.commit()
+
+    attempts = []
+
+    def offline(url):
+        attempts.append(url)
+        raise OSError("network is unreachable")
+
+    result = fetch_images.run(con, blobs, fetch=offline, stop_after_failures=3)
+
+    assert result.aborted and result.candidates == 10
+    assert len(attempts) == 3           # not all ten
+    assert len(result.failed) == 3
+
+
+def test_a_success_resets_the_failure_run(tmp_path):
+    """Two dead links either side of a live one is not 'the network is down'."""
+    data = tmp_path / "data"
+    data.mkdir()
+    con = db.connect(data / "archive.db")
+    blobs = BlobStore(data / "blobs")
+    src = db.source_id(con, "t3chat", "T3 Chat", "web")
+    messages = [
+        Message(native_id=f"m{i}", role="assistant", created_at=1771200000000 + i, seq=i,
+                parts=[Part(kind=KIND_IMAGE, seq=0, bytes=118,
+                            text=f"gen{i}.jpg https://cdn.example/f/{i}")])
+        for i in range(5)
+    ]
+    db.upsert_session(con, src, Session(
+        source_kind="t3chat", native_id="t3", title="mixed", workspace_key=None,
+        workspace_label=None, started_at=1771200000000, raw_path="/raw/x",
+        raw_hash="t3", messages=messages))
+    con.commit()
+
+    def flaky(url):
+        if url.endswith(("/1", "/3")):
+            return JPEG
+        raise OSError("dead")
+
+    result = fetch_images.run(con, blobs, fetch=flaky, stop_after_failures=3)
+
+    assert not result.aborted
+    assert result.fetched == 2 and len(result.failed) == 3
+
+
+def test_a_typed_command_never_gives_up_early(archive):
+    """`stop_after_failures` defaults off: the CLI works the whole list."""
+    _, con, blobs, _ = archive
+    result = fetch_images.run(con, blobs, fetch=lambda url: (_ for _ in ()).throw(
+        OSError("dead")))
+    assert not result.aborted

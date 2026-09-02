@@ -567,9 +567,18 @@ def export_cmd(
 @app.command()
 def serve(
     port: int = typer.Option(8787, "--port", "-p"),
+    no_fetch_images: bool = typer.Option(
+        False, "--no-fetch-images",
+        help="skip the startup backfill of images archived as a URL only"),
     data_dir: Path = typer.Option(None, "--data-dir"),
 ) -> None:
-    """Open the archive in a browser at http://127.0.0.1:<port>."""
+    """Open the archive in a browser at http://127.0.0.1:<port>.
+
+    On start, any image the archive holds only as a CDN link is fetched in the
+    background so that it renders in the page — the same work as `llma fetch-images`.
+    That is the one moment this server talks to anything but you; `--no-fetch-images`
+    keeps it entirely offline, and with none pending it never opens a socket anyway.
+    """
     import uvicorn
 
     from .web.app import create_app
@@ -579,7 +588,8 @@ def serve(
     typer.echo("  tool output. Do not bind it to 0.0.0.0 or put it behind a tunnel.\n")
     # host is hardcoded, not an option: making it configurable is how a private
     # archive ends up on a LAN.
-    uvicorn.run(create_app(data_dir), host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.run(create_app(data_dir, fetch_images=not no_fetch_images),
+                host="127.0.0.1", port=port, log_level="warning")
 
 
 @app.command("fetch-images")
@@ -591,8 +601,14 @@ def fetch_images_cmd(
     """Download images that were archived as a URL only, into the blob store.
 
     T3 Chat records a generated image as a CDN link and no bytes, so the viewer has
-    nothing to show. This is the one command in the archive that reaches the network on
-    purpose — it is deliberately not part of `ingest` or `sync`, which run unattended.
+    nothing to show. `llma serve` now does this for you in the background as it starts;
+    this is the way to run it on demand, and the way to retry after a start that found
+    the network down. It stays out of `ingest` and `sync`, which run unattended and
+    should not decide on their own to talk to a third-party CDN.
+
+    Unlike the startup backfill, this works the whole list rather than giving up after a
+    run of failures: you are watching it, and one dead link is not a reason to skip the
+    live ones behind it.
 
     Safe to re-run: parts that already have bytes are skipped.
     """

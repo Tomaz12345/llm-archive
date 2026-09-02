@@ -97,12 +97,18 @@ def _asset_version() -> str:
         return "0"
 
 
-def create_app(data_dir: Path | None = None) -> FastAPI:
+def create_app(data_dir: Path | None = None, *,
+               fetch_images: bool = True) -> FastAPI:
     db_path, blob_dir = ingest.default_paths(data_dir)
     vectors_dir = db_path.parent / "vectors"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # Started first, because it is the one thing here that waits on somebody else's
+        # server: it should be running while the embedder loads, not after it.
+        if fetch_images:
+            from ..core.fetch_images import backfill_on_start
+            backfill_on_start(db_path, blob_dir)
         # Load the embedding model before the first visitor waits on it. Cold ONNX
         # load is ~5 s in-process and was measured at 17 s through the server, which
         # reads as "this is broken" rather than "this is starting".

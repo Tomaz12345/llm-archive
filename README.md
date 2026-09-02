@@ -33,8 +33,13 @@ that is worth embedding, fused by weighted RRF. Both are needed: on paraphrased 
 the reason this project exists — BM25 alone finds the right session first once in nine
 tries. Multilingual model, so an English query finds a Slovene conversation.
 
-**Runs entirely offline.** The embedding model is local (118M params, ONNX, CPU). No API
-keys, no cloud, no telemetry. The web UI binds to `127.0.0.1` and vendors nothing from a CDN.
+**Runs entirely offline,** with one deliberate exception. The embedding model is local
+(118M params, ONNX, CPU). No API keys, no cloud, no telemetry. The web UI binds to
+`127.0.0.1` and vendors nothing from a CDN. The exception is `fetch-images`: T3 Chat
+archives a generated image as a link and no bytes, so `serve` backfills those in the
+background as it starts. It opens no socket when none are pending, and
+`serve --no-fetch-images` keeps it strictly offline. A page still never hotlinks — the
+bytes are in the blob store before anything renders.
 
 **Nothing is scraped.** Official exports and stores already on your disk. No site
 credentials are stored and no session is fetched on your behalf.
@@ -120,6 +125,7 @@ Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
 ```bash
 llma show 412 --tools             # one session as a transcript
 llma serve                        # web UI on http://127.0.0.1:8787
+llma serve --no-fetch-images      # ... without the startup image backfill
 
 llma export 412 --format html,md
 llma export --workspace payments-api --zip --out ./out
@@ -142,7 +148,7 @@ llma stats                        # what's in the archive
 | `llma validate` | check the message DAG for structural corruption |
 | `llma doctor` | report record types no adapter handled |
 | `llma browser` | opt-in: read OpenRouter's chats from its own browser IndexedDB store |
-| `llma fetch-images` | download images archived as a URL only (the one command that uses the network) |
+| `llma fetch-images` | download images archived as a URL only; `llma serve` also does this at startup |
 
 More: [automation](docs/automation.md) · [multi-machine](docs/multi-machine.md) ·
 [per-source format notes](docs/formats/)
