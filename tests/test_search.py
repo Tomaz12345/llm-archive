@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from llm_archive.core import db
@@ -12,7 +13,10 @@ from llm_archive.search import fts
 from llm_archive.search.chunker import (
     MAX_CHARS, chunk_part, context_header, strip_header,
 )
-from llm_archive.search.hybrid import Filters, search
+from llm_archive.search.embed import MODEL_TAG, VectorStore
+from llm_archive.search.hybrid import (
+    Filters, _session_centroid, _session_gist, related, search,
+)
 
 
 # ------------------------------------------------------------- chunker ----
@@ -102,6 +106,13 @@ def test_filters_exclude_abandoned_by_default():
 def test_filters_can_include_abandoned():
     where, _ = Filters(include_abandoned=True).sql()
     assert "on_active_path" not in where
+
+
+def test_filters_can_exclude_one_session():
+    """`related` needs the source session gone before the candidate budget is spent."""
+    where, params = Filters(exclude_session=7).sql()
+    assert "m.session_id != ?" in where
+    assert params == (7,)
 
 
 def test_filters_build_params_in_order():
@@ -332,3 +343,146 @@ def test_orphaned_rows_cannot_make_a_fresh_index_look_stale(tmp_path):
         con.execute(f"SELECT COUNT(*) {selection.EMBEDDABLE_FROM} "
                     f"{selection.EMBEDDABLE_WHERE}").fetchone()[0], \
         "indexer and health check must count the same population"
+
+
+# ------------------------------------------------------------- related ----
+
+def test_related_finds_the_sibling(tmp_path):
+    """Two VS Code sessions both about renaming: each should surface the other."""
+    con = build_archive(tmp_path)
+    fts.rebuild(con)
+    hits = related(con, tmp_path / "vectors", 4)
+    assert hits, "no neighbours"
+    assert hits[0].title == "Remote ssh chat"
+
+
+def test_related_never_returns_the_session_itself(tmp_path):
+    con = build_archive(tmp_path)
+    fts.rebuild(con)
+    for sid in (1, 2, 3, 4, 5):
+        assert all(h.session_id != sid
+                   for h in related(con, tmp_path / "vectors", sid))
+
+
+def test_related_works_without_vectors(tmp_path):
+    """An archive indexed with --no-vectors still gets the keyword half."""
+    con = build_archive(tmp_path)
+    fts.rebuild(con)
+    hits = related(con, tmp_path / "vectors", 4)
+    assert hits and all(h.matched_by == "keyword" for h in hits)
+
+
+def test_related_respects_filters(tmp_path):
+    con = build_archive(tmp_path)
+    fts.rebuild(con)
+    assert related(con, tmp_path / "vectors", 4,
+                   filters=Filters(sources=("codex",))) == []
+
+
+def test_related_on_an_unknown_session_is_empty(tmp_path):
+    con = build_archive(tmp_path)
+    fts.rebuild(con)
+    assert related(con, tmp_path / "vectors", 999) == []
+
+
+def test_gist_is_the_title_and_the_opening_question(tmp_path):
+    """Not the whole transcript: build_match keeps 24 terms, so what goes in matters."""
+    con = build_archive(tmp_path)
+    gist = _session_gist(con, 1)
+    assert gist.startswith("Offside detection work")
+    assert "how do I detect an offside line" in gist
+    # the assistant's reply is not what the session is *about*
+    assert "second-rearmost" not in gist
+
+
+def test_gist_falls_back_when_a_session_has_no_user_text(tmp_path):
+    """A resumed agent run can have no user turn at all and must still be queryable."""
+    con = build_archive(tmp_path)
+    con.execute("UPDATE message SET role='assistant' WHERE session_id=1")
+    con.commit()
+    gist = _session_gist(con, 1)
+    assert "offside" in gist.lower()
+
+
+# --------------------------------------------------- related: the dense half ----
+#
+# The vector half of `related` cannot be reached with the real embedder in a test that
+# has to stay offline, so the store is built by hand: four dimensions instead of 384,
+# and vectors chosen so the expected neighbour is arithmetic rather than a judgement
+# call. Everything under test — the centroid, the store lookup, the session filter —
+# is dimension-agnostic.
+
+def fake_vectors(con, tmp_path, by_session: dict[int, list[list[float]]]) -> None:
+    """One chunk row per supplied vector, so each session's centroid is predictable."""
+    matrix, vec_row = [], 0
+    for session_id, vectors in by_session.items():
+        anchor = con.execute("""
+            SELECT p.id AS pid, m.id AS mid FROM part p
+            JOIN message m ON m.id = p.message_id
+            WHERE m.session_id = ? ORDER BY m.seq, p.seq LIMIT 1""",
+            (session_id,)).fetchone()
+        for seq, vector in enumerate(vectors):
+            con.execute("""INSERT INTO chunk(part_id, message_id, session_id, seq,
+                                             text, vec_row, model_tag)
+                           VALUES (?,?,?,?,'chunk',?,?)""",
+                        (anchor["pid"], anchor["mid"], session_id, seq, vec_row,
+                         MODEL_TAG))
+            matrix.append(vector)
+            vec_row += 1
+    con.commit()
+    rows = np.asarray(matrix, dtype=np.float32)
+    VectorStore(tmp_path / "vectors", MODEL_TAG).save(
+        rows / np.linalg.norm(rows, axis=1, keepdims=True))
+
+
+def test_related_ranks_by_the_centroid_of_the_session_vectors(tmp_path):
+    con = build_archive(tmp_path)
+    fake_vectors(con, tmp_path, {1: [[1, 0, 0, 0]], 2: [[0.95, 0.31, 0, 0]],
+                                 3: [[0, 0, 1, 0]], 4: [[0, 0, 0, 1]],
+                                 5: [[0, -1, 0, 0]]})
+    hits = related(con, tmp_path / "vectors", 1, mode="semantic")
+    assert [h.session_id for h in hits][0] == 2
+    assert all(h.matched_by == "semantic" for h in hits)
+
+
+def test_the_dense_half_also_drops_the_session_asked_about(tmp_path):
+    """Its own chunks score 1.0 against its own centroid; nothing else would rank."""
+    con = build_archive(tmp_path)
+    fake_vectors(con, tmp_path, {1: [[1, 0, 0, 0]], 2: [[0.95, 0.31, 0, 0]]})
+    assert all(h.session_id != 1
+               for h in related(con, tmp_path / "vectors", 1, mode="semantic"))
+
+
+def test_centroid_is_a_unit_vector(tmp_path):
+    con = build_archive(tmp_path)
+    fake_vectors(con, tmp_path, {1: [[1, 0, 0, 0], [0, 1, 0, 0]]})
+    _, centroid = _session_centroid(con, tmp_path / "vectors", 1, MODEL_TAG)
+    assert float(np.linalg.norm(centroid)) == pytest.approx(1.0, abs=1e-5)
+    assert centroid.tolist() == pytest.approx([0.7071, 0.7071, 0, 0], abs=1e-4)
+
+
+def test_a_long_session_is_sampled_across_its_length_not_truncated(tmp_path, monkeypatch):
+    """Averaging 900 chunks whole is mush; averaging the first N is only its opening."""
+    monkeypatch.setattr("llm_archive.search.hybrid.CENTROID_CHUNKS", 2)
+    con = build_archive(tmp_path)
+    fake_vectors(con, tmp_path, {1: [[1, 0, 0, 0], [0, 1, 0, 0],
+                                     [0, 0, 1, 0], [0, 0, 0, 1]]})
+    _, centroid = _session_centroid(con, tmp_path / "vectors", 1, MODEL_TAG)
+    # stride 2 over four chunks takes the 1st and the 3rd — the end is represented
+    assert centroid.tolist() == pytest.approx([0.7071, 0, 0.7071, 0], abs=1e-4)
+
+
+def test_a_session_with_no_chunks_has_no_centroid(tmp_path):
+    con = build_archive(tmp_path)
+    fake_vectors(con, tmp_path, {1: [[1, 0, 0, 0]]})
+    _, centroid = _session_centroid(con, tmp_path / "vectors", 2, MODEL_TAG)
+    assert centroid is None
+
+
+def test_hybrid_related_uses_both_halves(tmp_path):
+    con = build_archive(tmp_path)
+    fts.rebuild(con)
+    fake_vectors(con, tmp_path, {4: [[1, 0, 0, 0]], 5: [[0.99, 0.14, 0, 0]]})
+    hits = related(con, tmp_path / "vectors", 4)
+    assert hits[0].session_id == 5
+    assert hits[0].matched_by == "both"

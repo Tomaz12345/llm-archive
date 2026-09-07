@@ -30,6 +30,27 @@ def _open(data_dir: Path | None):
     return db.connect(db_path), BlobStore(blob_dir), db_path
 
 
+def _echo_json(payload) -> None:
+    """One JSON document on stdout. Indented: a person reads these too."""
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _echo_hits(hits) -> None:
+    """The ranked list `search` and `related` both print."""
+    for i, hit in enumerate(hits, 1):
+        when = (datetime.fromtimestamp(hit.started_at / 1000, timezone.utc)
+                .strftime("%Y-%m-%d") if hit.started_at else "?")
+        where = f" · {hit.workspace}" if hit.workspace else ""
+        machine = f" · {hit.host}" if hit.host else ""
+        typer.echo(f"\n{i:>2}. {hit.title or '(untitled)'}")
+        typer.echo(f"    {when} · {hit.source}{where}{machine}"
+                   f" · {hit.matched_by} · {hit.score:.4f}  [#{hit.session_id}]")
+        for snip in hit.snippets[:2]:
+            text = " ".join((snip.text or "").split())
+            if text:
+                typer.echo(f"    {snip.role[:9]:<9} {text[:150]}")
+
+
 def _report(res, echo=typer.echo) -> None:
     """The per-adapter result block, shared by `ingest` and `add`."""
     line = (f"  files {res.files}  new {res.new}  updated {res.updated}  "
@@ -394,43 +415,88 @@ def search_cmd(
                              help="hybrid | keyword | semantic"),
     abandoned: bool = typer.Option(False, "--abandoned",
                                    help="include abandoned branches"),
+    json_out: bool = typer.Option(False, "--json",
+                                  help="emit JSON instead of a printed list"),
     data_dir: Path = typer.Option(None, "--data-dir"),
 ) -> None:
     """Search the archive."""
+    from . import api
     from .search.hybrid import Filters
     from .search.hybrid import search as run_search
 
     con, _, db_path = _open(data_dir)
     vectors_dir = (data_dir or db_path.parent) / "vectors"
 
-    def as_ms(value: str | None) -> int | None:
-        if not value:
-            return None
-        return int(datetime.strptime(value, "%Y-%m-%d")
-                   .replace(tzinfo=timezone.utc).timestamp() * 1000)
-
     filters = Filters(sources=tuple(source or ()), participant=participant,
                       workspace=workspace, host=host,
-                      since=as_ms(since), until=as_ms(until),
+                      since=api.parse_day(since), until=api.parse_day(until),
                       include_abandoned=abandoned)
-    hits = run_search(con, vectors_dir, query, limit=limit, filters=filters, mode=mode)
 
+    if json_out:
+        _echo_json(api.search_payload(con, vectors_dir, query, limit=limit,
+                                      filters=filters, mode=mode))
+        return
+
+    hits = run_search(con, vectors_dir, query, limit=limit, filters=filters, mode=mode)
     if not hits:
         typer.echo("no matches")
         raise typer.Exit()
+    _echo_hits(hits)
 
-    for i, hit in enumerate(hits, 1):
-        when = (datetime.fromtimestamp(hit.started_at / 1000, timezone.utc)
-                .strftime("%Y-%m-%d") if hit.started_at else "?")
-        where = f" · {hit.workspace}" if hit.workspace else ""
-        machine = f" · {hit.host}" if hit.host else ""
-        typer.echo(f"\n{i:>2}. {hit.title or '(untitled)'}")
-        typer.echo(f"    {when} · {hit.source}{where}{machine}"
-                   f" · {hit.matched_by} · {hit.score:.4f}  [#{hit.session_id}]")
-        for snip in hit.snippets[:2]:
-            text = " ".join((snip.text or "").split())
-            if text:
-                typer.echo(f"    {snip.role[:9]:<9} {text[:150]}")
+
+@app.command()
+def related(
+    session_id: int = typer.Argument(..., help="session id to find neighbours for"),
+    limit: int = typer.Option(10, "--limit", "-n"),
+    source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
+    participant: str = typer.Option(None, "--participant", "-p"),
+    workspace: str = typer.Option(None, "--workspace", "-w"),
+    host: str = typer.Option(None, "--host"),
+    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
+    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    abandoned: bool = typer.Option(False, "--abandoned",
+                                   help="include abandoned branches"),
+    json_out: bool = typer.Option(False, "--json",
+                                  help="emit JSON instead of a printed list"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Sessions most like a given one. The session is the query — you supply none.
+
+    Useful when `search` lands near the right conversation but not on it, and for
+    pulling together a recurring problem that was discussed under different words
+    months apart.
+    """
+    from . import api
+    from .search.hybrid import Filters
+    from .search.hybrid import related as run_related
+
+    con, _, db_path = _open(data_dir)
+    vectors_dir = (data_dir or db_path.parent) / "vectors"
+    filters = Filters(sources=tuple(source or ()), participant=participant,
+                      workspace=workspace, host=host,
+                      since=api.parse_day(since), until=api.parse_day(until),
+                      include_abandoned=abandoned)
+
+    if json_out:
+        payload = api.related_payload(con, vectors_dir, session_id,
+                                      limit=limit, filters=filters)
+        if payload is None:
+            _echo_json({"error": f"no session #{session_id}"})
+            raise typer.Exit(1)
+        _echo_json(payload)
+        return
+
+    row = api.session_row(con, session_id)
+    if row is None:
+        typer.echo(f"no session #{session_id}")
+        raise typer.Exit(1)
+    typer.echo(f"like #{session_id}: {row['title'] or '(untitled)'}")
+
+    hits = run_related(con, vectors_dir, session_id, limit=limit, filters=filters)
+    if not hits:
+        typer.echo("nothing similar")
+        raise typer.Exit()
+    _echo_hits(hits)
 
 
 @app.command()
@@ -438,10 +504,25 @@ def show(
     session_id: int = typer.Argument(..., help="session id from search results"),
     tools: bool = typer.Option(False, "--tools", help="include tool calls"),
     abandoned: bool = typer.Option(False, "--abandoned"),
+    json_out: bool = typer.Option(False, "--json",
+                                  help="emit JSON instead of a transcript"),
     data_dir: Path = typer.Option(None, "--data-dir"),
 ) -> None:
     """Print one session as a readable transcript."""
     con, _, _ = _open(data_dir)
+
+    if json_out:
+        # imported here rather than at the top of the function: `api` pulls in the
+        # search stack, and the transcript path below has no use for numpy.
+        from . import api
+        payload = api.session_payload(con, session_id, tools=tools,
+                                      abandoned=abandoned)
+        if payload is None:
+            _echo_json({"error": f"no session #{session_id}"})
+            raise typer.Exit(1)
+        _echo_json(payload)
+        return
+
     meta = con.execute("""
         SELECT s.title, s.started_at, s.host, s.raw_path, src.kind AS source,
                COALESCE(w.label,'') AS workspace
@@ -590,6 +671,19 @@ def serve(
     # archive ends up on a LAN.
     uvicorn.run(create_app(data_dir, fetch_images=not no_fetch_images),
                 host="127.0.0.1", port=port, log_level="warning")
+
+
+@app.command("mcp")
+def mcp_cmd(data_dir: Path = typer.Option(None, "--data-dir")) -> None:
+    """Serve the archive to an MCP client over stdio: search, show, related.
+
+    Read-only and offline — JSON-RPC on stdin and stdout, no socket. Meant to be
+    spawned by the client rather than run by hand. To register it with Claude Code:
+
+        claude mcp add llm-archive -- llma mcp
+    """
+    from .mcp.server import serve
+    serve(data_dir=data_dir)
 
 
 @app.command("fetch-images")

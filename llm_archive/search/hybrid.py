@@ -15,13 +15,21 @@ without paying that price; `tools/tune_fusion.py` fits the weight on the eval se
 
 Scoring is session-level because that is what a person is looking for — "the chat where
 I worked out the offside thing" — with the best-matching parts returned as snippets.
+
+`related()` is the same machinery driven by a session instead of a typed query: the
+session's own chunk vectors are averaged into a centroid for the dense side, and its
+title plus opening user turns become the BM25 query. Both retrievers and the fusion are
+shared with `search()`, so "more like this" ranks on the same terms a query does and
+needs no stored similarity matrix.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import numpy as np
 
 from . import fts
 from .chunker import strip_header
@@ -46,6 +54,12 @@ RRF_K = 60
 DEFAULT_WEIGHTS = (1.0, 3.0)
 
 CANDIDATES = 80                  # per retriever, before fusion
+
+# How many of a session's chunks the `related` centroid averages. A 900-chunk agent
+# session averaged whole is mush — every topic it ever touched, pulled to the middle of
+# the corpus. The sample is strided rather than truncated so a long session is still
+# represented by its end as well as its opening.
+CENTROID_CHUNKS = 120
 
 
 @dataclass
@@ -80,6 +94,10 @@ class Filters:
     since: int | None = None
     until: int | None = None
     include_abandoned: bool = False
+    # drop one session from the candidates entirely. `related` sets it to the session
+    # being asked about: excluding it after fusion would be too late, because its own
+    # parts win every retriever and would eat most of the CANDIDATES budget first.
+    exclude_session: int | None = None
 
     def sql(self) -> tuple[str, tuple]:
         clauses, params = [], []
@@ -103,6 +121,9 @@ class Filters:
             params.append(self.until)
         if not self.include_abandoned:
             clauses.append("m.on_active_path = 1")
+        if self.exclude_session:
+            clauses.append("m.session_id != ?")
+            params.append(self.exclude_session)
         return (" AND ".join(clauses), tuple(params))
 
 
@@ -131,14 +152,51 @@ def search(con: sqlite3.Connection, vectors_dir: Path, query: str, *,
         semantic_parts = _semantic(con, vectors_dir, query, filters,
                                    model_name, model_tag)
 
+    return _fuse(con, keyword_parts, semantic_parts, weights=weights, limit=limit,
+                 snippets_per_hit=snippets_per_hit)
+
+
+def related(con: sqlite3.Connection, vectors_dir: Path, session_id: int, *,
+            limit: int = 10, filters: Filters | None = None, mode: str = "hybrid",
+            weights: tuple[float, float] = DEFAULT_WEIGHTS,
+            model_tag: str = MODEL_TAG,
+            snippets_per_hit: int = 2) -> list[Hit]:
+    """Sessions that resemble `session_id`, ranked by the same fusion as `search`.
+
+    Nothing is stored: the session is turned into a query on the spot — a centroid of
+    its own chunk vectors for the dense side, its title and opening user turns for
+    BM25. An archive indexed with `--no-vectors` still gets the keyword half.
+    """
+    filters = replace(filters or Filters(), exclude_session=session_id)
+    where, params = filters.sql()
+    where_sql = f" AND {where}" if where else ""
+
+    keyword_parts: list[tuple[int, float]] = []
+    if mode in ("hybrid", "keyword"):
+        gist = _session_gist(con, session_id)
+        if gist:
+            keyword_parts = fts.search(con, gist, limit=CANDIDATES,
+                                       where=where_sql, params=params)
+
+    semantic_parts: list[tuple[int, float]] = []
+    if mode in ("hybrid", "semantic"):
+        store, centroid = _session_centroid(con, vectors_dir, session_id, model_tag)
+        if centroid is not None:
+            semantic_parts = _semantic_vec(con, store, centroid, filters, model_tag)
+
+    return _fuse(con, keyword_parts, semantic_parts, weights=weights, limit=limit,
+                 snippets_per_hit=snippets_per_hit)
+
+
+def _fuse(con, keyword_parts: list[tuple[int, float]],
+          semantic_parts: list[tuple[int, float]], *, weights: tuple[float, float],
+          limit: int, snippets_per_hit: int) -> list[Hit]:
+    """Collapse both retrievers' parts to sessions, fuse the ranks, dress the winners."""
     if not keyword_parts and not semantic_parts:
         return []
 
-    kw_sessions = _to_sessions(con, keyword_parts)
-    sem_sessions = _to_sessions(con, semantic_parts)
-
-    kw_rank = _rank_map(kw_sessions)
-    sem_rank = _rank_map(sem_sessions)
+    kw_rank = _rank_map(_to_sessions(con, keyword_parts))
+    sem_rank = _rank_map(_to_sessions(con, semantic_parts))
 
     w_kw, w_sem = weights
     fused: dict[int, float] = {}
@@ -178,12 +236,66 @@ def search(con: sqlite3.Connection, vectors_dir: Path, query: str, *,
     return hits
 
 
+def _session_gist(con, session_id: int, chars: int = 600) -> str:
+    """The BM25 query a session stands for: its title, then what was first asked.
+
+    Not the whole transcript. `fts.build_match` keeps 24 terms, so feeding it everything
+    would just hand it the first 24 words of whatever came first — often a pasted stack
+    trace. The title and the opening question are what the session is *about*.
+    """
+    row = con.execute("SELECT title FROM session WHERE id = ?", (session_id,)).fetchone()
+    if row is None:
+        return ""
+    bits = [row["title"]] if row["title"] else []
+    # A session with no user text at all — a resumed agent run, an import that lost the
+    # prompt — still has to produce a query, so fall back to any text part.
+    for role in ("user", None):
+        role_sql = "AND m.role = ?" if role else ""
+        args = (session_id, role) if role else (session_id,)
+        texts = [r["text"] for r in con.execute(f"""
+            SELECT p.text FROM part p JOIN message m ON m.id = p.message_id
+            WHERE m.session_id = ? AND p.kind = 'text' AND p.text IS NOT NULL
+              AND m.on_active_path = 1 {role_sql}
+            ORDER BY m.seq, p.seq LIMIT 3""", args)]
+        if texts:
+            bits.extend(texts)
+            break
+    return " ".join(" ".join(b.split()) for b in bits if b)[:chars]
+
+
+def _session_centroid(con, vectors_dir: Path, session_id: int, model_tag: str):
+    """(store, unit centroid) over one session's chunks; centroid None without vectors."""
+    store = VectorStore(vectors_dir, model_tag)
+    matrix = store.load()
+    if matrix is None or len(matrix) == 0:
+        return store, None
+    rows = [r["vec_row"] for r in con.execute(
+        "SELECT vec_row FROM chunk WHERE session_id = ? AND model_tag = ? ORDER BY seq",
+        (session_id, model_tag)) if 0 <= r["vec_row"] < len(matrix)]
+    if not rows:
+        return store, None
+    if len(rows) > CENTROID_CHUNKS:
+        step = len(rows) / CENTROID_CHUNKS
+        rows = [rows[int(i * step)] for i in range(CENTROID_CHUNKS)]
+    centroid = np.asarray(matrix[rows], dtype=np.float32).mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
+    if norm < 1e-9:
+        return store, None
+    return store, centroid / norm
+
+
 def _semantic(con, vectors_dir: Path, query: str, filters: Filters,
               model_name: str, model_tag: str) -> list[tuple[int, float]]:
     store = VectorStore(vectors_dir, model_tag)
     if store.load() is None:
         return []
     qvec = get_embedder(model_name, model_tag).encode_queries([query])[0]
+    return _semantic_vec(con, store, qvec, filters, model_tag)
+
+
+def _semantic_vec(con, store: VectorStore, qvec, filters: Filters,
+                  model_tag: str) -> list[tuple[int, float]]:
+    """The half of `_semantic` that does not care where the query vector came from."""
     rows = store.search(qvec, top=CANDIDATES * 3)
     if not rows:
         return []

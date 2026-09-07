@@ -47,6 +47,12 @@ credentials are stored and no session is fetched on your behalf.
 **Local web UI.** `llma serve` — faceted browse by source / workspace / model / machine /
 tag, full transcript view, and a statistics dashboard with token and cost breakdowns.
 
+**Your agents can read it too.** `llma mcp` serves the archive to any MCP client over
+stdio — `search`, `show` and `related`, all read-only — so Claude Code can answer *"have
+I solved this before?"* mid-session instead of you alt-tabbing to the web UI. The
+transport is a pipe: no socket, no key, nothing leaves the machine. Everything the tools
+return is also on the CLI as `--json`.
+
 **Export back out.** Any session, or a filtered batch, as self-contained HTML or Markdown
 with assets bundled. Secrets are redacted by default on the way out.
 
@@ -115,6 +121,7 @@ llma index --no-vectors           # keyword only, seconds
 llma search "postgres deadlock"
 llma search "kako naredim migracijo" --source claude_code --since 2026-01-01
 llma search "the offside thing" --mode semantic -n 20
+llma search "postgres deadlock" --json     # same results, for a script
 ```
 
 Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
@@ -124,6 +131,9 @@ Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
 
 ```bash
 llma show 412 --tools             # one session as a transcript
+llma show 412 --json              # ... as a JSON document
+llma related 412                  # sessions most like it; the session is the query
+
 llma serve                        # web UI on http://127.0.0.1:8787
 llma serve --no-fetch-images      # ... without the startup image backfill
 
@@ -131,7 +141,24 @@ llma export 412 --format html,md
 llma export --workspace payments-api --zip --out ./out
 ```
 
-### 4. Keep it current
+### 4. Let your coding agent read it
+
+`llma serve` is for you. This is for whatever is already running in your terminal:
+
+```bash
+claude mcp add llm-archive -- llma mcp
+```
+
+That registers a stdio MCP server with three read-only tools — `search`, `show`,
+`related` — over the same hybrid retrieval the CLI uses. The point is the session you
+are in the middle of: last March's fix for this exact stack trace is already in the
+archive, and now the agent can find it without being told it exists.
+
+`llma mcp` is meant to be spawned by the client, not run by hand; it speaks JSON-RPC on
+stdin and stdout and opens no socket. Add `--data-dir` if your archive is not in the
+default place.
+
+### 5. Keep it current
 
 ```bash
 llma sync                         # ingest every source, then re-index
@@ -161,10 +188,15 @@ More: [automation](docs/automation.md) · [multi-machine](docs/multi-machine.md)
 and any API key that leaked into them, all concentrated into one searchable place. It is
 in `.gitignore` and must never reach a remote. Do not expose `llma serve` beyond localhost.
 
+`llma mcp` changes nothing about that. It is read-only — every tool is a SELECT — and it
+talks over the pipe its client spawned it on, not a port. What it does change is *who*
+reads the archive: an assistant you have given it to sees whatever it searches, so the
+same judgement applies as to pasting a transcript into a chat.
+
 ## Development
 
 ```bash
 uv pip install -e ".[web,embed,dev]"
-pytest        # 545 tests, all offline — every fixture is inline
+pytest        # 613 tests, all offline — every fixture is inline
 ruff check .
 ```
