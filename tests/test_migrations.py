@@ -205,3 +205,97 @@ def test_v8_backfill_uses_the_same_kinds_as_the_ingest_path(tmp_path):
     assert db._TURN_KIND_SQL == ", ".join(f"'{k}'" for k in sorted(TURN_KINDS))
     for kind in TURN_KINDS:
         assert f"'{kind}'" in db.MIGRATIONS[8][2]
+
+
+def make_v9(path: Path) -> None:
+    """A database as it looked before session grouping.
+
+    Built by stripping the v10 additions back out of SCHEMA, so the ALTERs and the two
+    CREATE TABLEs in MIGRATIONS[10] really have to run rather than being swallowed as
+    duplicates or as `IF NOT EXISTS` no-ops.
+    """
+    schema = db.SCHEMA
+    for line in ("  continues_session_id INTEGER REFERENCES session(id),\n",
+                 "  continues_overlap    INTEGER,\n",
+                 "  superseded       INTEGER NOT NULL DEFAULT 0,\n"):
+        assert line in schema, "SCHEMA changed; this fixture no longer strips v10"
+        schema = schema.replace(line, "")
+    for start in ("CREATE TABLE IF NOT EXISTS topic",
+                  "CREATE TABLE IF NOT EXISTS session_topic"):
+        i = schema.index(start)
+        schema = schema[:i] + schema[schema.index(";", i) + 1:]
+
+    con = sqlite3.connect(path)
+    con.executescript(schema)
+    con.execute("INSERT INTO meta(key,value) VALUES ('schema_version','9')")
+    con.execute("INSERT INTO source(id,kind,label,surface) "
+                "VALUES (1,'claude_code','Claude Code','cli')")
+    con.execute("""INSERT INTO session(id,source_id,native_id,started_at,msg_count,
+                                       raw_path,raw_hash,ingested_at)
+                   VALUES (1,1,'s1',1,2,'x','h',1)""")
+    con.executemany("""INSERT INTO message(id,session_id,native_id,seq,on_active_path,
+                                           role,created_at)
+                       VALUES (?,1,?,?,1,?,1)""",
+                    [(1, "u1", 0, "user"), (2, "u2", 1, "assistant")])
+    con.commit()
+    con.close()
+
+
+def test_v10_adds_the_grouping_columns_and_tables(tmp_path):
+    path = tmp_path / "a.db"
+    make_v9(path)
+    con = db.connect(path)
+
+    session_cols = {r[1] for r in con.execute("PRAGMA table_info(session)")}
+    assert {"continues_session_id", "continues_overlap"} <= session_cols
+    assert "superseded" in {r[1] for r in con.execute("PRAGMA table_info(message)")}
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"topic", "session_topic"} <= tables
+    assert con.execute("SELECT value FROM meta WHERE key='schema_version'"
+                       ).fetchone()[0] == str(db.SCHEMA_VERSION)
+
+
+def test_v10_leaves_existing_rows_counted(tmp_path):
+    """`superseded` defaults to 0, so nothing an existing archive holds silently stops
+    counting the moment the migration runs."""
+    path = tmp_path / "a.db"
+    make_v9(path)
+    con = db.connect(path)
+
+    assert con.execute("SELECT COUNT(*) FROM message WHERE superseded = 0"
+                       ).fetchone()[0] == 2
+    assert con.execute("SELECT COUNT(*) FROM session "
+                       "WHERE continues_session_id IS NULL").fetchone()[0] == 1
+    assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_v10_is_safe_to_re_run(tmp_path):
+    path = tmp_path / "a.db"
+    make_v9(path)
+    db.connect(path).close()
+    con = db.connect(path)
+    assert con.execute("SELECT COUNT(*) FROM message").fetchone()[0] == 2
+
+
+def test_v10_ddl_is_shared_between_fresh_and_migrated(tmp_path):
+    """A new table has to be written into SCHEMA *and* MIGRATIONS or one kind of
+    database never gets it. Sharing the constant is what makes that impossible."""
+    assert db.TOPIC_DDL in db.MIGRATIONS[10]
+    assert db.SESSION_TOPIC_DDL in db.MIGRATIONS[10]
+    assert db.TOPIC_DDL.strip() in db.SCHEMA
+    assert db.SESSION_TOPIC_DDL.strip() in db.SCHEMA
+
+
+def test_fresh_and_migrated_databases_agree(tmp_path):
+    """The two paths must produce the same schema, or a bug only reproduces on one."""
+    migrated = tmp_path / "old.db"
+    make_v9(migrated)
+    con_migrated = db.connect(migrated)
+    con_fresh = db.connect(tmp_path / "new.db")
+
+    def shape(con, table):
+        return {(r[1], r[2]) for r in con.execute(f"PRAGMA table_info({table})")}
+
+    for table in ("session", "message", "topic", "session_topic"):
+        assert shape(con_migrated, table) == shape(con_fresh, table), table

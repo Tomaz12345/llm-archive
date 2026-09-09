@@ -125,6 +125,18 @@ So resumed sessions do not replay history into a new file; each file is self-con
 column in the schema (it costs nothing and other sources may need it), and add a cheap
 ingest-time assertion that flags if cross-file duplication ever rises above a few percent.
 
+> **Correction (2026-09-09): this no longer holds.** The finding above was accurate when
+> taken and has since been overtaken by a change in Claude Code itself. Re-running
+> `tools/probe_resume.py` against a corpus grown from 9 projects / 93 files / 23,735
+> records to 14 / 154 / 36,586 turns the verdict over: one file now replays another's
+> leading message uuids in full, so a resume *can* fork. The linkage work was done after
+> all — as `session.continues_session_id`, detected by `core/lineage.py` over
+> `message.native_id` rather than over the raw files, which covers every source instead
+> of just Claude Code. `parent_session_id` was left alone and still means "subagent
+> transcript of". The "cheap assertion" suggested here is what `llma lineage` became.
+>
+> The measurement was right both times. Treat the *verdict* as dated, not the numbers.
+
 ## 3b. A ninth source found — VS Code chat (answers open question Q3)
 
 `PLAN.md §9 Q3` asked whether VS Code workspace storage was worth probing. It is:

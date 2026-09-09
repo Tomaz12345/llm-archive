@@ -30,7 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from ..core import db, idb, ingest, reopen
+from ..core import db, idb, ingest, lineage, reopen
 from ..core.blobs import IMAGE_MIMES, BlobStore, blob_path, sniff_file
 from ..export.render import (
     caption_of as _caption,
@@ -145,6 +145,13 @@ def create_app(data_dir: Path | None = None, *,
             ({"type": k, "n": sum(n for _, n in v)} for k, v in index.items()),
             key=lambda e: -e["n"])
 
+    def topic_facet(con) -> list[dict]:
+        from ..search.topics import topic_facet as build_facet
+        try:
+            return build_facet(con)
+        except sqlite3.OperationalError:
+            return []            # pre-v10 archive; the migration adds the tables
+
     def facets(con) -> dict:
         return {
             "sources": con.execute("""
@@ -176,6 +183,9 @@ def create_app(data_dir: Path | None = None, *,
                 LEFT JOIN session_tag st ON st.tag_id = t.id
                 GROUP BY t.id ORDER BY t.name""").fetchall(),
             "model_types": model_type_facet(con),
+            # Derived, not typed: see search/topics.py. Empty until an index with
+            # vectors has run, and the sidebar hides the group entirely when so.
+            "topics": topic_facet(con),
         }
 
     def totals(con) -> dict:
@@ -184,6 +194,31 @@ def create_app(data_dir: Path | None = None, *,
                    (SELECT COUNT(*) FROM message WHERE on_active_path=1) messages,
                    (SELECT COUNT(*) FROM chunk) chunks""").fetchone()
         return dict(row)
+
+    def _related_panel(con, session_id: int, limit: int = 6) -> list[dict]:
+        """Sessions that resemble this one, for the reader's sidebar.
+
+        `hybrid.related` has existed since the MCP server shipped and was reachable only
+        from a terminal; this is the same call, rendered. Nothing is precomputed — the
+        session becomes a query on the spot.
+
+        Never raises. An archive indexed with --no-vectors still gets the keyword half,
+        one with no index at all gets an empty panel, and neither is worth a 500 on a page
+        whose actual job is showing the transcript.
+        """
+        from ..search.hybrid import related as run_related
+        try:
+            hits = run_related(con, vectors_dir, session_id, limit=limit,
+                               snippets_per_hit=1)
+        except Exception:  # noqa: BLE001 - a broken vector store must not hide the session
+            return []
+        # Condensed like a search result: `_snippets` strips the chunk header but leaves
+        # the part's own newlines, which render as a ragged block under a one-line title.
+        # Not highlighted -- there is no query here, only a session.
+        return [{"hit": h, "when": _fmt(h.started_at),
+                 "snippet": _condense(h.snippets[0].text) if h.snippets else "",
+                 "role": h.snippets[0].role if h.snippets else ""}
+                for h in hits]
 
     # ------------------------------------------------------------------ views
 
@@ -194,7 +229,8 @@ def create_app(data_dir: Path | None = None, *,
              # and the filter silently does nothing.
              source: list[str] = Query(default=[]), participant: str = "",
              workspace: str = "", host: str = "", since: str = "", until: str = "",
-             tag: str = "", model_type: str = "", abandoned: bool = False, limit: int = 25):
+             tag: str = "", model_type: str = "", topic: str = "",
+             abandoned: bool = False, limit: int = 25):
         from ..stats import metrics
         from ..stats.model_types import model_type_index
 
@@ -214,6 +250,7 @@ def create_app(data_dir: Path | None = None, *,
                                     participant=participant or None,
                                     workspace=workspace or None,
                                     host=host or None,
+                                    topic=topic or None,
                                     since=_as_ms(since), until=_as_ms(until),
                                     include_abandoned=abandoned),
                     mode=mode, weights=DEFAULT_WEIGHTS)
@@ -256,7 +293,7 @@ def create_app(data_dir: Path | None = None, *,
             "selected_sources": selected_sources, "participant": participant,
             "workspace": workspace,
             "host": host, "since": since, "until": until, "tag": tag,
-            "model_type": model_type,
+            "model_type": model_type, "topic": topic,
             "abandoned": abandoned, "elapsed": elapsed, "error": error,
             # a stale index misleads here more than anywhere else: these are the results
             "index": metrics.index_health(con), "fmt_when": _fmt,
@@ -379,6 +416,11 @@ def create_app(data_dir: Path | None = None, *,
             "tools": tools, "abandoned": abandoned, "q": q,
             "dag": _dag_summary(con, session_id),
             "share_prompt_json": json.dumps(share_prompt),
+            # Two sessions can be one conversation: --resume forks a new transcript and
+            # replays the old one into it. Without this the reader has no way to know the
+            # other half exists.
+            "lineage": lineage.chain(con, session_id),
+            "related": _related_panel(con, session_id),
         })
 
     def _export_html(session_id: int, *, download: bool, tools: bool, abandoned: bool,
@@ -640,7 +682,8 @@ def create_app(data_dir: Path | None = None, *,
     @app.get("/browse", response_class=HTMLResponse)
     def browse(request: Request, workspace: str = "", source: str = "",
                participant: str = "", host: str = "", tag: str = "",
-               model_type: str = "", limit: int = 100, offset: int = 0):
+               model_type: str = "", topic: str = "",
+               limit: int = 100, offset: int = 0):
         from ..stats import model_types
 
         con = connect()
@@ -661,6 +704,11 @@ def create_app(data_dir: Path | None = None, *,
             clauses.append("""s.id IN (SELECT st.session_id FROM session_tag st
                                        JOIN tag t ON t.id=st.tag_id WHERE t.name=?)""")
             params.append(tag)
+        if topic:
+            clauses.append("""s.id IN (SELECT st.session_id FROM session_topic st
+                                       JOIN topic t ON t.id=st.topic_id
+                                      WHERE t.slug=?)""")
+            params.append(topic)
         if model_type:
             # no `model_type` column to join on — resolve the matching raw model
             # strings in Python (model_types.classify) and filter on those instead.
@@ -673,6 +721,7 @@ def create_app(data_dir: Path | None = None, *,
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = con.execute(f"""
             SELECT s.id, s.title, s.started_at, s.msg_count, s.host, s.model_primary,
+                   s.continues_session_id,
                    src.kind AS source_kind, COALESCE(w.label,'') AS workspace,
                    json_extract(s.meta,'$.participant_label') AS participant
             FROM session s JOIN source src ON src.id = s.source_id
@@ -694,7 +743,7 @@ def create_app(data_dir: Path | None = None, *,
                      for r in rows],
             "facets": facets(con), "totals": totals(con), "count": count,
             "workspace": workspace, "source": source, "participant": participant,
-            "host": host, "tag": tag, "model_type": model_type,
+            "host": host, "tag": tag, "model_type": model_type, "topic": topic,
             "offset": offset, "limit": limit,
         })
 

@@ -449,3 +449,67 @@ def test_open_refuses_a_session_that_opens_with_a_link(client, monkeypatch):
 def test_open_on_an_unknown_session_is_404(client, monkeypatch):
     _launched(monkeypatch)
     assert client.post("/session/999999/open").status_code == 404
+
+
+# ------------------------------------------------------- session grouping (v10)
+
+def test_related_panel_survives_a_missing_vector_store(client):
+    """The fixture builds no vectors. The panel must degrade, never 500 the transcript."""
+    r = client.get("/session/1")
+    assert r.status_code == 200
+    assert "Offside detection work" in r.text
+
+
+def test_topic_facet_is_hidden_until_groups_exist(client):
+    """An archive that has never been indexed with vectors has no groups, and an empty
+    dropdown labelled Topic is worse than no dropdown."""
+    for path in ("/", "/browse"):
+        assert 'name="topic"' not in client.get(path).text
+
+
+def test_topic_facet_appears_and_filters(client, tmp_path):
+    con = sqlite3.connect(tmp_path / "data" / "archive.db")
+    con.execute("INSERT INTO topic(id,slug,label,size,built_at,model_tag) "
+                "VALUES (1,'offside-vlan','offside · vlan',1,1,'t')")
+    con.execute("INSERT INTO session_topic(session_id,topic_id) VALUES (1,1)")
+    con.commit()
+    con.close()
+
+    listing = client.get("/browse")
+    assert 'name="topic"' in listing.text
+    assert "offside · vlan" in listing.text
+
+    kept = client.get("/browse?topic=offside-vlan")
+    assert "Offside detection work" in kept.text
+    assert "Copilot refactor" not in kept.text
+
+
+def test_lineage_banner_names_both_halves(client, tmp_path):
+    con = sqlite3.connect(tmp_path / "data" / "archive.db")
+    con.execute("UPDATE session SET continues_session_id=1, continues_overlap=2 "
+                "WHERE id=2")
+    con.commit()
+    con.close()
+
+    child = client.get("/session/2")
+    assert "Continues" in child.text and 'href="/session/1"' in child.text
+    parent = client.get("/session/1")
+    assert "Continued in" in parent.text and 'href="/session/2"' in parent.text
+
+
+def test_no_lineage_banner_when_a_session_stands_alone(client):
+    assert "Continued in" not in client.get("/session/3").text
+
+
+def test_stats_reports_what_lineage_removed(client, tmp_path):
+    con = sqlite3.connect(tmp_path / "data" / "archive.db")
+    con.execute("UPDATE session SET continues_session_id=1, continues_overlap=2 "
+                "WHERE id=2")
+    con.execute("UPDATE message SET superseded=1 WHERE session_id=1")
+    con.commit()
+    con.close()
+
+    r = client.get("/stats")
+    assert r.status_code == 200
+    assert "Continued sessions" in r.text
+    assert "continuation" in r.text

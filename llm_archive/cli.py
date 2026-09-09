@@ -51,6 +51,23 @@ def _echo_hits(hits) -> None:
                 typer.echo(f"    {snip.role[:9]:<9} {text[:150]}")
 
 
+def _report_relink(res, echo=typer.echo) -> None:
+    """What lineage detection found. Silent when there is nothing to say.
+
+    Printed because it changes the numbers: from here on the archive holds fewer
+    conversations than sessions, and that should be something you were told rather than
+    something you discover on /stats.
+    """
+    if not res["continuations"]:
+        return
+    echo(f"\nlineage: {res['continuations']} continuation(s) detected — "
+         f"{res['superseded_messages']} replayed message(s) will not be counted twice")
+    for pair in res["pairs"]:
+        arrow = "replays all of" if pair["whole_parent"] else "branches from"
+        echo(f"  #{pair['child']} {arrow} #{pair['parent']}  "
+             f"({pair['overlap']} messages)")
+
+
 def _report(res, echo=typer.echo) -> None:
     """The per-adapter result block, shared by `ingest` and `add`."""
     line = (f"  files {res.files}  new {res.new}  updated {res.updated}  "
@@ -153,6 +170,8 @@ def add_cmd(
         for adapter in adapters:
             typer.echo(f"\n=== {adapter.label} ===")
             _report(ingest.run(adapter, con, blobs))
+
+    _report_relink(ingest.relink(con))
 
     typer.echo(f"\n-> {db_path}")
     typer.echo("run `llma index` (or `llma sync`) to make the new sessions searchable")
@@ -257,6 +276,8 @@ def ingest_cmd(
     for adapter in adapters:
         typer.echo(f"\n=== {adapter.label} ===")
         _report(ingest.run(adapter, con, blobs, force=force))
+
+    _report_relink(ingest.relink(con))
     typer.echo(f"\n-> {db_path}")
 
 
@@ -394,6 +415,7 @@ def index_cmd(
         typer.echo("  vectors    skipped — keyword search only")
     else:
         typer.echo(f"  vectors    {res.vectors} x 384  [{res.model_tag}]")
+        typer.echo(f"  topics     {res.topics} group(s)  (llma topics to list them)")
     typer.echo(f"  {res.seconds:.1f}s")
     for warning in res.warnings:
         typer.echo(f"  ! {warning}")
@@ -409,6 +431,8 @@ def search_cmd(
                                          "e.g. copilot (see: llma stats)"),
     workspace: str = typer.Option(None, "--workspace", "-w"),
     host: str = typer.Option(None, "--host"),
+    topic: str = typer.Option(None, "--topic",
+                              help="a derived topic group's slug (see: llma topics)"),
     since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
     until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
     mode: str = typer.Option("hybrid", "--mode",
@@ -428,7 +452,7 @@ def search_cmd(
     vectors_dir = (data_dir or db_path.parent) / "vectors"
 
     filters = Filters(sources=tuple(source or ()), participant=participant,
-                      workspace=workspace, host=host,
+                      workspace=workspace, host=host, topic=topic,
                       since=api.parse_day(since), until=api.parse_day(until),
                       include_abandoned=abandoned)
 
@@ -452,6 +476,8 @@ def related(
     participant: str = typer.Option(None, "--participant", "-p"),
     workspace: str = typer.Option(None, "--workspace", "-w"),
     host: str = typer.Option(None, "--host"),
+    topic: str = typer.Option(None, "--topic",
+                              help="a derived topic group's slug (see: llma topics)"),
     since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
     until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
     abandoned: bool = typer.Option(False, "--abandoned",
@@ -473,7 +499,7 @@ def related(
     con, _, db_path = _open(data_dir)
     vectors_dir = (data_dir or db_path.parent) / "vectors"
     filters = Filters(sources=tuple(source or ()), participant=participant,
-                      workspace=workspace, host=host,
+                      workspace=workspace, host=host, topic=topic,
                       since=api.parse_day(since), until=api.parse_day(until),
                       include_abandoned=abandoned)
 
@@ -769,6 +795,94 @@ def fetch_images_cmd(
         typer.echo(f"  skipped {result.skipped} (no URL in the reference)")
     for part_id, why in result.failed:
         typer.echo(f"  failed  part {part_id}: {why}")
+
+
+@app.command()
+def topics(
+    threshold: float = typer.Option(None, "--threshold", "-t",
+                                    help="how alike sessions must be to group "
+                                         "(0-1; lower groups more)"),
+    min_size: int = typer.Option(None, "--min-size",
+                                 help="smallest group worth keeping"),
+    rebuild: bool = typer.Option(False, "--rebuild",
+                                 help="recompute now instead of listing what exists"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Topic groups derived from the embeddings — the grouping nobody has to maintain.
+
+    Rebuilt automatically at the end of every `llma index` that produces vectors. Run it
+    here with --rebuild to retune the granularity without paying for a re-embed:
+
+        llma topics                          # what the groups currently are
+        llma topics --rebuild -t 0.5         # coarser: fewer, broader groups
+        llma topics --rebuild -t 0.65        # finer: more, tighter groups
+
+    Sessions that resemble nothing else are left out rather than forced into a group, so
+    the counts below will not add up to the size of the archive. That is the intended
+    answer for a personal archive full of one-off questions.
+    """
+    from .search import topics as topic_build
+
+    con, _, db_path = _open(data_dir)
+    vectors_dir = (data_dir or db_path.parent) / "vectors"
+
+    if rebuild or threshold is not None or min_size is not None:
+        kwargs = {}
+        if threshold is not None:
+            kwargs["threshold"] = threshold
+        if min_size is not None:
+            kwargs["min_size"] = min_size
+        res = topic_build.build(con, vectors_dir, **kwargs)
+        if json_out:
+            _echo_json(res)
+            return
+        if res.get("skipped"):
+            typer.echo(res["reason"])
+            raise typer.Exit(1)
+        typer.echo(f"{res['topics']} group(s) over {res['vectors']} sessions "
+                   f"(threshold {res['threshold']}, min size {res['min_size']})")
+        typer.echo(f"  {res['assigned']} assigned, {res['unclustered']} unclustered\n")
+
+    rows = topic_build.topic_facet(con)
+    if json_out:
+        _echo_json({"topics": rows})
+        return
+    if not rows:
+        typer.echo("no topic groups yet — run `llma index` (with vectors), "
+                   "or `llma topics --rebuild`")
+        raise typer.Exit(1)
+    width = min(max(len(r["label"]) for r in rows), 46)
+    for r in rows:
+        label = r["label"] if len(r["label"]) <= width else r["label"][:width - 1] + "…"
+        typer.echo(f"  {r['n']:>4}  {label:<{width}}  {r['slug']}")
+    typer.echo("\nfilter with: llma search <query> --topic <slug>")
+
+
+@app.command()
+def lineage(
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Re-detect which sessions are continuations of other sessions.
+
+    Runs automatically after every ingest; this is the way to re-run it on its own, and
+    the way to see what it found. A resumed conversation does not always keep writing
+    into the file it started in -- Claude Code's --resume opens a new transcript and
+    replays the old one into it, so one conversation becomes two session rows whose
+    shared prefix would otherwise be counted twice in every figure on /stats.
+
+    Safe to re-run: the marks are rebuilt from scratch each time.
+    """
+    con, _, _ = _open(data_dir)
+    res = ingest.relink(con)
+    if json_out:
+        _echo_json(res)
+        return
+    if not res["continuations"]:
+        typer.echo("no continuations found — every session stands alone")
+        return
+    _report_relink(res)
 
 
 @app.command()

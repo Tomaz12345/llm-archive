@@ -64,6 +64,22 @@
   </div>
   {% endif %}
 
+  {# Derived from the embeddings, not typed by hand -- so it exists without upkeep.
+     Hidden entirely until an index with vectors has produced groups. #}
+  {% if facets.topics %}
+  <div class="fgroup">
+    <h3>Topic</h3>
+    <select name="topic">
+      <option value="">any topic</option>
+      {% for t in facets.topics %}
+        <option value="{{ t.slug }}" {% if t.slug == topic %}selected{% endif %}>
+          {{ t.label }} ({{ t.n }})
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
+
   {% if facets.model_types %}
   <div class="fgroup">
     <h3>Model type</h3>

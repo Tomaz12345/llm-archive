@@ -19,6 +19,28 @@
       {% endif %}
     </div>
 
+    {# Two session rows, one conversation. A resume opens a fresh transcript and replays
+       the old one into it, so without this the reader sees a session that stops mid-thought
+       and has no way to find where it went. #}
+    {% if lineage.continues or lineage.continued_by %}
+      <div class="lineage">
+        {% if lineage.continues %}
+          <span class="lineage-arrow" aria-hidden="true">↑</span>
+          <span>Continues
+            <a href="/session/{{ lineage.continues.id }}">#{{ lineage.continues.id }}</a>
+            — its first {{ lineage.continues.overlap }} messages are replayed here, and
+            counted only once.</span>
+        {% endif %}
+        {% if lineage.continued_by %}
+          <span class="lineage-arrow" aria-hidden="true">↓</span>
+          <span>Continued in
+            <a href="/session/{{ lineage.continued_by.id }}">#{{ lineage.continued_by.id }}</a>
+            — that session replays these {{ lineage.continued_by.overlap }} messages and
+            carries on.</span>
+        {% endif %}
+      </div>
+    {% endif %}
+
     <div class="rstats">
       <span>{{ dag.total }} messages</span>
       {% if dag.abandoned %}
@@ -183,6 +205,36 @@
         <a href="/session/{{ meta.id }}?offset={{ offset + page }}&q={{ q|urlencode }}&tools={{ 'true' if tools else 'false' }}">next →</a>
       {% endif %}
     </nav>
+  {% endif %}
+
+  {# Derived on the spot from this session's own vectors and opening turns — nothing is
+     stored, so it follows the archive as it grows. Absent rather than empty when there is
+     no index to ask. #}
+  {% if related %}
+    <section class="related">
+      <h2>Related sessions</h2>
+      {% for item in related %}
+        {% set h = item.hit %}
+        <article class="hit">
+          <a class="hit-title" href="/session/{{ h.session_id }}">
+            {{ h.title or "(untitled)" }}
+          </a>
+          <div class="hit-meta">
+            <span class="chip src-{{ h.source }}">{{ h.source }}</span>
+            <span>{{ item.when }}</span>
+            {% if h.workspace %}<span>· {{ h.workspace }}</span>{% endif %}
+            {% if h.host %}<span>· {{ h.host }}</span>{% endif %}
+            <span class="match match-{{ h.matched_by }}" title="which retriever found it">
+              {{ h.matched_by }}
+            </span>
+          </div>
+          {% if item.snippet %}
+            <p class="snippet"><span class="role">{{ item.role }}</span>{{
+              item.snippet|truncate(200) }}</p>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
   {% endif %}
 </div>
 

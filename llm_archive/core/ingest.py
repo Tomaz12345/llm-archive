@@ -143,6 +143,19 @@ def run(adapter, con, blobs: BlobStore | None = None,
     return result
 
 
+def relink(con) -> dict:
+    """Re-derive session lineage. Call once after ingesting, not once per adapter.
+
+    Deliberately outside `run()`: a continuation and the session it continues are two rows
+    that only have to share a source, and the second of them may arrive in a later adapter
+    or a later ingest entirely. Detection therefore has to see the finished archive, and it
+    rebuilds its marks from scratch, so calling it once at the end is both cheaper and more
+    correct than calling it thirteen times on the way there.
+    """
+    from . import lineage
+    return lineage.detect(con)
+
+
 def local_host() -> str:
     import socket
     return socket.gethostname()

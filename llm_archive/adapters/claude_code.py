@@ -14,16 +14,27 @@ Also handled, all found in Phase 0:
   * `thinking` blocks stored empty — dropped, never stored as empty rows (§1.2)
   * one project directory holding up to 6 cwds, some differing only by case (§3d)
 
-**Resume appends in place; there is nothing to link.** §8.2 kept `parent_session_id`
-against the possibility that `--resume` forks a new `<uuid>.jsonl` replaying the old
-one's history, which would make one conversation read as two sessions and count its
-shared prefix twice. `tools/probe_resume.py` measured it across 9 projects, 93 files and
-23,735 records: **zero** files share a leading message-uuid prefix with another, and
-zero share message uuids at all. A resumed session keeps writing into its original file,
-so it arrives here as a file whose bytes changed — which the merge in `db.upsert_session`
-already handles by appending the new records to the existing session. `parent_session_id`
-is therefore used only for subagent transcripts. Re-run the probe if this ever looks
-wrong; it is read-only and takes a few seconds.
+**Resume sometimes forks, and the fork is linked by `core.lineage`.** §8.2 kept
+`parent_session_id` against the possibility that `--resume` opens a new `<uuid>.jsonl`
+replaying the old one's history, which makes one conversation read as two sessions and
+counts its shared prefix twice.
+
+That possibility was measured and dismissed, and the dismissal has since expired. The
+phase 0 run of `tools/probe_resume.py` saw 9 projects, 93 files and 23,735 records and
+found zero shared prefixes; re-run against 14 projects, 154 files and 36,586 records it
+finds one, a clean whole-parent replay. Both readings were correct when taken -- Claude
+Code's behaviour changed between them, so this is a fact with a date on it rather than a
+property of the format.
+
+What that means here: a resumed session may arrive either as a file whose bytes grew
+(handled by the merge in `db.upsert_session`) or as a new file replaying an old one
+(detected after ingest by `core.lineage`, which sets `session.continues_session_id` and
+marks the replayed copies `message.superseded` so they are counted once). The pointer is
+deliberately not `parent_session_id`, which still means "subagent transcript of" and
+nothing else.
+
+The probe is read-only and takes a few seconds. Re-run it if this looks wrong again --
+it is expected to, eventually.
 """
 
 from __future__ import annotations

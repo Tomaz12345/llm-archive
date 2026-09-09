@@ -26,7 +26,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .core import reopen
+from .core import lineage, reopen
 from .search.hybrid import Filters, Hit, related as run_related, search as run_search
 
 # Ceilings, all overridable per call. A snippet is a hook to decide whether to open the
@@ -236,6 +236,10 @@ def session_payload(con: sqlite3.Connection, session_id: int, *,
 
     return {
         "session": session_brief(row),
+        # Half a conversation reads as a whole one otherwise: a resumed session replays
+        # its predecessor, so a caller citing this transcript needs to know the rest of it
+        # is filed under another id.
+        "lineage": lineage.chain(con, session_id),
         "included_kinds": list(kinds),
         "messages": [messages[mid] for mid in order],
         "parts": kept,

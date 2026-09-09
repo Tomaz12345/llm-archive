@@ -91,6 +91,10 @@ class Filters:
     participant: str | None = None
     workspace: str | None = None
     host: str | None = None
+    # a derived topic group's slug (see search/topics.py). SQL-level rather than a
+    # post-filter on the hit list: filtering after fusion would silently shrink an
+    # already-truncated result set, so a narrow topic would come back looking empty.
+    topic: str | None = None
     since: int | None = None
     until: int | None = None
     include_abandoned: bool = False
@@ -113,6 +117,10 @@ class Filters:
         if self.host:
             clauses.append("COALESCE(s.host,'') = ?")
             params.append(self.host)
+        if self.topic:
+            clauses.append("s.id IN (SELECT st.session_id FROM session_topic st "
+                           "JOIN topic t ON t.id = st.topic_id WHERE t.slug = ?)")
+            params.append(self.topic)
         if self.since:
             clauses.append("s.started_at >= ?")
             params.append(self.since)
@@ -263,6 +271,24 @@ def _session_gist(con, session_id: int, chars: int = 600) -> str:
     return " ".join(" ".join(b.split()) for b in bits if b)[:chars]
 
 
+def pool_rows(matrix, rows: list[int]):
+    """The unit vector a set of chunk rows stands for, or None if it has no direction.
+
+    The single definition of "the vector for a session", shared by `related` here and by
+    `topics`, which clusters the same vectors. Two definitions would mean the neighbours
+    on a session's page and the group it was filed under disagreed about what it is about,
+    which is the sort of difference nobody can debug from the outside.
+    """
+    if not rows:
+        return None
+    if len(rows) > CENTROID_CHUNKS:
+        step = len(rows) / CENTROID_CHUNKS
+        rows = [rows[int(i * step)] for i in range(CENTROID_CHUNKS)]
+    centroid = np.asarray(matrix[rows], dtype=np.float32).mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
+    return None if norm < 1e-9 else centroid / norm
+
+
 def _session_centroid(con, vectors_dir: Path, session_id: int, model_tag: str):
     """(store, unit centroid) over one session's chunks; centroid None without vectors."""
     store = VectorStore(vectors_dir, model_tag)
@@ -272,16 +298,7 @@ def _session_centroid(con, vectors_dir: Path, session_id: int, model_tag: str):
     rows = [r["vec_row"] for r in con.execute(
         "SELECT vec_row FROM chunk WHERE session_id = ? AND model_tag = ? ORDER BY seq",
         (session_id, model_tag)) if 0 <= r["vec_row"] < len(matrix)]
-    if not rows:
-        return store, None
-    if len(rows) > CENTROID_CHUNKS:
-        step = len(rows) / CENTROID_CHUNKS
-        rows = [rows[int(i * step)] for i in range(CENTROID_CHUNKS)]
-    centroid = np.asarray(matrix[rows], dtype=np.float32).mean(axis=0)
-    norm = float(np.linalg.norm(centroid))
-    if norm < 1e-9:
-        return store, None
-    return store, centroid / norm
+    return store, pool_rows(matrix, rows)
 
 
 def _semantic(con, vectors_dir: Path, query: str, filters: Filters,

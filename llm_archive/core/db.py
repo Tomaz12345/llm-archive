@@ -21,7 +21,37 @@ from .models import TURN_KINDS, Session
 # MIGRATIONS[6] adds to an existing one.
 from .redact import MIGRATION as REDACTION_DDL
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+
+# v10. Derived topic groups, rebuilt wholesale by `llma topics` / the tail of `llma index`.
+#
+# Shared by SCHEMA and MIGRATIONS[10] for the reason INDEX_RUN_DDL is: migrations only run
+# on an EXISTING database, so a new table written only there never reaches a fresh one.
+#
+# `session_topic.session_id` is the primary key, so assignment is hard and single: a session
+# belongs to one group or to none. Sessions with no chunks (nothing embeddable, or indexed
+# with --no-vectors) simply get no row and read as unclustered, which is honest — the
+# alternative is a group that means "we had nothing to go on".
+TOPIC_DDL = """
+CREATE TABLE IF NOT EXISTS topic (
+  id        INTEGER PRIMARY KEY,
+  slug      TEXT NOT NULL UNIQUE,
+  label     TEXT NOT NULL,
+  size      INTEGER NOT NULL DEFAULT 0,
+  -- JSON: the scored terms the label was drawn from, kept so a puzzling label can be
+  -- explained without re-running the build
+  terms     TEXT,
+  built_at  INTEGER NOT NULL,
+  model_tag TEXT NOT NULL
+)"""
+
+SESSION_TOPIC_DDL = """
+CREATE TABLE IF NOT EXISTS session_topic (
+  session_id INTEGER PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+  topic_id   INTEGER NOT NULL REFERENCES topic(id) ON DELETE CASCADE,
+  -- cosine to the group centroid, ordering a group most-typical-first
+  similarity REAL
+)"""
 
 # v9. Which export files the archive has taken in, keyed by content.
 #
@@ -185,6 +215,29 @@ MIGRATIONS = {
         DROP_DDL,
         "CREATE INDEX IF NOT EXISTS idx_drop_kind ON drop_file(kind)",
         "CREATE INDEX IF NOT EXISTS idx_session_raw_path ON session(raw_path)"],
+    # v10: session grouping, two independent relations that both answer "which rows belong
+    # together".
+    #
+    # `continues_session_id` is lineage. Claude Code's --resume was measured in phase 0 as
+    # appending in place, and that finding was written into the adapter docstring; re-running
+    # tools/probe_resume.py on a corpus half again as large (14 projects, 154 files, 36,586
+    # records) turns it over — a resume now forks a new JSONL whose leading records replay the
+    # old one's uuids, so one conversation becomes two session rows and the shared prefix is
+    # counted twice in every statistic. The pointer sits on the CHILD, naming what it
+    # continues. It is deliberately NOT parent_session_id: that column already means "subagent
+    # transcript of" and conflating the two would corrupt the subagent counts on the session
+    # page.
+    #
+    # `message.superseded` is the half that fixes the arithmetic. Marking the replayed copies
+    # rather than the whole parent session is what makes a fork that branched MID-session come
+    # out right: only the shared prefix stops counting, and the parent's own divergent tail
+    # still does. The default of 0 is correct for every pre-v10 row — nothing was known to be
+    # a replay before this, and lineage.detect() rebuilds the marks from scratch anyway.
+    10: ["ALTER TABLE session ADD COLUMN continues_session_id INTEGER REFERENCES session(id)",
+         "ALTER TABLE session ADD COLUMN continues_overlap INTEGER",
+         "ALTER TABLE message ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0",
+         TOPIC_DDL,
+         SESSION_TOPIC_DDL],
 }
 
 
@@ -237,6 +290,11 @@ CREATE TABLE IF NOT EXISTS session (
   -- when the snapshot this was parsed from was TAKEN, not when it was ingested.
   -- What lets a re-ingest refuse to apply an older export over a newer one.
   exported_at       INTEGER,
+  -- the session this one resumed: its opening messages replay that session's. Set on the
+  -- CHILD, derived by core.lineage, and distinct from parent_session_id above, which means
+  -- "subagent transcript of".
+  continues_session_id INTEGER REFERENCES session(id),
+  continues_overlap    INTEGER,
   meta              TEXT,
   UNIQUE (source_id, native_id)
 );
@@ -258,6 +316,9 @@ CREATE TABLE IF NOT EXISTS message (
   -- set when a re-ingest no longer found this message in the source. The row stays:
   -- an export that has lost history must not take it out of the archive too.
   absent_since     INTEGER,
+  -- this message is replayed verbatim by a later session that resumed this one, so it is
+  -- the stale copy of the two and does not count. Derived by core.lineage.
+  superseded       INTEGER NOT NULL DEFAULT 0,
   meta             TEXT,
   UNIQUE (session_id, native_id)
 );
@@ -367,6 +428,8 @@ CREATE TABLE IF NOT EXISTS drop_file (
 );
 CREATE INDEX IF NOT EXISTS idx_drop_kind ON drop_file(kind);
 
+""" + TOPIC_DDL + ";" + SESSION_TOPIC_DDL + """;
+
 CREATE INDEX IF NOT EXISTS idx_session_raw_path ON session(raw_path);
 CREATE INDEX IF NOT EXISTS idx_session_time   ON session(started_at);
 CREATE INDEX IF NOT EXISTS idx_session_source ON session(source_id, started_at);
@@ -389,6 +452,10 @@ CREATE INDEX IF NOT EXISTS idx_part_embed     ON part(embed_eligible) WHERE embe
 POST_SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_part_redacted ON part(redacted) WHERE redacted > 0",
     "CREATE INDEX IF NOT EXISTS idx_msg_turn ON message(session_id, is_turn)",
+    """CREATE INDEX IF NOT EXISTS idx_session_continues ON session(continues_session_id)
+         WHERE continues_session_id IS NOT NULL""",
+    "CREATE INDEX IF NOT EXISTS idx_msg_superseded ON message(session_id, superseded)",
+    "CREATE INDEX IF NOT EXISTS idx_session_topic_topic ON session_topic(topic_id)",
 ]
 
 

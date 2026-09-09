@@ -8,12 +8,22 @@
     <div class="tile">
       <dt>Sessions</dt>
       <dd>{{ "{:,}".format(d.overview.sessions) }}</dd>
-      <small>{{ d.overview.sources }} sources · {{ d.overview.hosts }} machines</small>
+      {# A continuation and the session it resumed are two rows and one conversation.
+         Said here rather than silently subtracted: every figure on this page counts
+         conversations, and a number that disagrees with COUNT(*) should explain itself. #}
+      {% if d.lineage.merged %}
+        <small>{{ "{:,}".format(d.overview.conversations) }} conversations ·
+          {{ d.lineage.merged }} continuation{{ "s" if d.lineage.merged != 1 }} merged</small>
+      {% else %}
+        <small>{{ d.overview.sources }} sources · {{ d.overview.hosts }} machines</small>
+      {% endif %}
     </div>
     <div class="tile">
       <dt>Messages</dt>
       <dd>{{ "{:,}".format(d.overview.messages) }}</dd>
-      <small>{{ "{:,}".format(d.overview.abandoned) }} abandoned, excluded</small>
+      <small>{{ "{:,}".format(d.overview.abandoned) }} abandoned, excluded{%
+        if d.lineage.superseded_messages %} ·
+        {{ "{:,}".format(d.lineage.superseded_messages) }} replayed{% endif %}</small>
     </div>
     <div class="tile">
       <dt>Turns</dt>
@@ -255,6 +265,43 @@
     </table>
   </section>
 
+  <section class="panel">
+    <h2>Continued sessions</h2>
+    <p class="sub">A resumed conversation does not always keep writing into the transcript
+      it started in: Claude Code's <code>--resume</code> opens a new one and replays the old
+      one into it. That makes two session rows out of one conversation, and the replayed
+      prefix would be counted twice in every figure above. The copies are detected by shared
+      message ids and excluded — re-run with <code>llma lineage</code>.</p>
+
+    {% if d.lineage.continuations %}
+      <p class="fresh"><b>{{ d.lineage.continuations }}
+        continuation{{ "s" if d.lineage.continuations != 1 }} found.</b>
+        {{ "{:,}".format(d.lineage.superseded_messages) }} replayed message{{
+          "s" if d.lineage.superseded_messages != 1 }},
+        {{ "{:,}".format(d.lineage.excluded_tok_out) }} output and
+        {{ "{:,}".format(d.lineage.excluded_cache_read) }} cache-read tokens excluded from
+        the totals above.</p>
+      <table class="grid">
+        <thead><tr><th>Conversation</th><th>Resumed as</th>
+                   <th class="num">Replayed</th><th>Kind</th></tr></thead>
+        <tbody>
+          {% for p in d.lineage.pairs %}
+            <tr>
+              <td><a href="/session/{{ p.parent_id }}">#{{ p.parent_id }}</a>
+                  {{ p.parent_title or "(untitled)" }}</td>
+              <td><a href="/session/{{ p.child_id }}">#{{ p.child_id }}</a></td>
+              <td class="num">{{ "{:,}".format(p.overlap) }}</td>
+              <td>{% if p.whole %}replayed in full{% else %}branched mid-session{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="sub"><b>None found.</b> Every session in the archive stands alone.</p>
+    {% endif %}
+  </section>
+
+  <!-- ---------------------------------------------------------------- -->
   <section class="panel">
     <h2>Search index</h2>
     <p class="sub">Ingesting rewrites a session's parts and their ids move with them.

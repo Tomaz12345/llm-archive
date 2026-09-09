@@ -13,6 +13,17 @@ and the answer decides whether §5 of the import plan is real work or a docs not
   merge upsert already handles it, because the file's raw_hash changes and the extra
   messages arrive as an append to the same native_id.
 
+**Answered: it forks** — as of 2026-09-09, over 14 projects / 154 files / 36,586 records.
+An earlier run over 9 / 93 / 23,735 found no forks at all, so this is a fact with a date
+on it: Claude Code changed, and it may change again.
+
+The linkage that answer called for is `llm_archive/core/lineage.py`, which asks the same
+question of the archive instead of the file tree — over `message.native_id`, so it covers
+all twelve sources rather than just this one, and it can write the answer down
+(`session.continues_session_id` plus `message.superseded`). Run `llma lineage` for that.
+This probe stays because it needs no database and can be pointed at any `.claude` tree,
+including one copied off another machine before it has ever been ingested.
+
 Read-only. Writes nothing, touches no database.
 
     uv run python tools/probe_resume.py [--root ~/.claude/projects] [--json]

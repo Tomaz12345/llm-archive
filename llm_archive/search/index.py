@@ -24,6 +24,7 @@ class IndexResult:
     chars: int = 0
     skipped_vectors: bool = False
     model_tag: str = MODEL_TAG
+    topics: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -124,6 +125,19 @@ def _build(con: sqlite3.Connection, vectors_dir: Path,
         [(c.part_id, c.message_id, c.session_id, c.seq, c.text, i, model_tag)
          for i, c in enumerate(chunks)])
     con.commit()
+
+    # Topic groups are pooled from the vectors that were just written, so this is the one
+    # moment they are guaranteed to describe the current archive. Only ever reached on a
+    # build that produced vectors: a --no-vectors run returned above, which is what keeps a
+    # keyword-only rebuild from dissolving a perfectly good set of groups -- the same
+    # reasoning as the chunk DELETE it also skips.
+    try:
+        from . import topics as topic_build
+        result.topics = topic_build.build(con, vectors_dir,
+                                          model_tag=model_tag)["topics"]
+    except Exception as exc:  # noqa: BLE001 - search must survive a grouping failure
+        result.warnings.append(f"topic build failed ({type(exc).__name__}: "
+                               f"{str(exc)[:120]}); search is unaffected")
 
     result.seconds = time.perf_counter() - t0
     return result

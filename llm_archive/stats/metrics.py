@@ -21,7 +21,7 @@ from ..core import freshness, redact
 from ..search import selection
 from . import model_types, pricing
 
-ACTIVE = "m.on_active_path = 1"
+ACTIVE = "m.on_active_path = 1 AND m.superseded = 0"
 
 # Messages and turns are different questions and both are reported.
 #
@@ -35,7 +35,28 @@ ACTIVE = "m.on_active_path = 1"
 # `turns` counts only messages carrying said-or-shown content (models.TURN_KINDS,
 # materialised as message.is_turn at ingest). That question means the same thing in
 # every source, so it is what cross-source tables rank by.
-TURN = "m.on_active_path = 1 AND m.is_turn = 1"
+TURN = "m.on_active_path = 1 AND m.is_turn = 1 AND m.superseded = 0"
+
+# Both predicates also drop `superseded` messages, which are the replayed copies a resumed
+# session left behind: Claude Code's --resume forks a new transcript and replays the old one
+# into it, so without this the shared prefix is counted once in each row (see core.lineage).
+# Marking messages rather than whole sessions is what keeps a fork that branched mid-session
+# honest -- only the replayed prefix stops counting, and the parent's own tail still does.
+#
+# Tokens cannot be fixed the same way. `message.tok_out` is populated on barely half the rows
+# and sums well under the session counter even where it is (131,885 against 195,262 on the one
+# pair this archive holds), so per-message token arithmetic would trade a 1% overcount for a
+# 30% undercount. Session-level counters are the only faithful source, and LIVE below is how
+# they are de-duplicated instead: a session drops out only when a continuation replays it
+# ENTIRELY, in which case its counters are wholly contained in that continuation's. A fork
+# that branched mid-session keeps its row, because part of what it counts happened nowhere
+# else. Requires the query to alias `session` as `s`.
+LIVE = """s.id NOT IN (
+    SELECT c.continues_session_id FROM session c
+     WHERE c.continues_session_id IS NOT NULL
+       AND c.continues_overlap >= (SELECT COUNT(*) FROM message m2
+                                    WHERE m2.session_id = c.continues_session_id
+                                      AND m2.on_active_path = 1))"""
 
 
 def overview(con: sqlite3.Connection) -> dict:
@@ -47,10 +68,13 @@ def overview(con: sqlite3.Connection) -> dict:
                (SELECT COUNT(*) FROM chunk) chunks,
                (SELECT COUNT(*) FROM source) sources,
                (SELECT COUNT(DISTINCT host) FROM session WHERE host IS NOT NULL) hosts,
-               (SELECT COALESCE(SUM(tok_in),0) FROM session) tok_in,
-               (SELECT COALESCE(SUM(tok_out),0) FROM session) tok_out,
-               (SELECT COALESCE(SUM(tok_cache_read),0) FROM session) cache_read,
-               (SELECT COALESCE(SUM(tok_cache_write),0) FROM session) cache_write,
+               (SELECT COALESCE(SUM(s.tok_in),0) FROM session s WHERE {LIVE}) tok_in,
+               (SELECT COALESCE(SUM(s.tok_out),0) FROM session s WHERE {LIVE}) tok_out,
+               (SELECT COALESCE(SUM(s.tok_cache_read),0) FROM session s
+                 WHERE {LIVE}) cache_read,
+               (SELECT COALESCE(SUM(s.tok_cache_write),0) FROM session s
+                 WHERE {LIVE}) cache_write,
+               (SELECT COUNT(*) FROM session s WHERE {LIVE}) conversations,
                (SELECT MIN(started_at) FROM session WHERE started_at > 0) first_at,
                (SELECT MAX(started_at) FROM session) last_at
     """).fetchone()
@@ -60,7 +84,7 @@ def overview(con: sqlite3.Connection) -> dict:
 
 
 def by_source(con) -> list[dict]:
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT src.kind, src.label, src.surface, COUNT(*) sessions,
                COALESCE(SUM(s.msg_count),0) messages,
                COALESCE(SUM(s.turn_count),0) turns,
@@ -69,6 +93,7 @@ def by_source(con) -> list[dict]:
                COALESCE(SUM(s.tok_cache_read),0) cache_read,
                COALESCE(SUM(s.tok_cache_write),0) cache_write
         FROM session s JOIN source src ON src.id = s.source_id
+        WHERE {LIVE}
         GROUP BY src.id ORDER BY sessions DESC""").fetchall()
     return [dict(r) for r in rows]
 
@@ -204,6 +229,12 @@ def models(con) -> list[dict]:
                COALESCE(SUM(s.tok_in),0) tok_in
         FROM message m JOIN session s ON s.id = m.session_id
                        JOIN source src ON src.id = s.source_id
+        -- Not the full ACTIVE predicate: this table has always counted abandoned
+        -- branches, unlike every other figure here. That is a separate inconsistency and
+        -- quietly fixing it under a grouping change would move numbers nobody asked
+        -- about. Replayed copies are excluded because they are not a second thing that
+        -- happened at all.
+        WHERE m.superseded = 0
         GROUP BY 1, 2 ORDER BY messages DESC""").fetchall()
 
     # token totals live on session, so attribute them per session to avoid
@@ -215,6 +246,7 @@ def models(con) -> list[dict]:
                COALESCE(SUM(s.tok_cache_read),0) cr,
                COALESCE(SUM(s.tok_cache_write),0) cw
         FROM session s JOIN source src ON src.id = s.source_id
+        WHERE {LIVE}
         GROUP BY 1, 2""").fetchall()
     tokens = {(r["model"], r["model_recorded"]): r for r in per_model_tokens}
 
@@ -248,13 +280,14 @@ def models(con) -> list[dict]:
 
 
 def cost_by_workspace(con) -> list[dict]:
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT COALESCE(w.label,'(none)') workspace, s.model_primary model,
                COALESCE(SUM(s.tok_in),0) tin, COALESCE(SUM(s.tok_out),0) tout,
                COALESCE(SUM(s.tok_cache_read),0) cr,
                COALESCE(SUM(s.tok_cache_write),0) cw,
                COUNT(*) sessions
         FROM session s LEFT JOIN workspace w ON w.id = s.workspace_id
+        WHERE {LIVE}
         GROUP BY workspace, model""").fetchall()
     totals: dict[str, dict] = {}
     for r in rows:
@@ -390,12 +423,14 @@ def workspaces(con, limit: int = 12) -> list[dict]:
     # name can exist on two machines as distinct workspace rows, and sessions with
     # no workspace ("(none)") span both real hosts and host-less web sessions —
     # without the host in the label those all render as indistinguishable bars.
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT COALESCE(w.label,'(none)') label, s.host host, COUNT(*) sessions,
                COALESCE(SUM(s.msg_count),0) messages,
                COALESCE(SUM(s.turn_count),0) turns
         FROM session s LEFT JOIN workspace w ON w.id = s.workspace_id
-        GROUP BY s.workspace_id, s.host ORDER BY messages DESC LIMIT ?""", (limit,)).fetchall()
+        WHERE {LIVE}
+        GROUP BY s.workspace_id, s.host ORDER BY messages DESC LIMIT ?""",
+        (limit,)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -407,11 +442,12 @@ def workspaces(con, limit: int = 12) -> list[dict]:
 
 
 def hosts(con) -> list[dict]:
-    rows = con.execute("""
-        SELECT COALESCE(host,'(web)') host, COUNT(*) sessions,
-               COALESCE(SUM(msg_count),0) messages,
-               COALESCE(SUM(turn_count),0) turns
-        FROM session GROUP BY host ORDER BY sessions DESC""").fetchall()
+    rows = con.execute(f"""
+        SELECT COALESCE(s.host,'(web)') host, COUNT(*) sessions,
+               COALESCE(SUM(s.msg_count),0) messages,
+               COALESCE(SUM(s.turn_count),0) turns
+        FROM session s WHERE {LIVE}
+        GROUP BY s.host ORDER BY sessions DESC""").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -432,17 +468,17 @@ def session_shape(con) -> dict:
     T3 Chat message. Sessions that are pure tool traffic get their own '0' bucket
     rather than being folded into '1-2'.
     """
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT CASE
                  WHEN turn_count = 0  THEN '0'
                  WHEN turn_count <= 2  THEN '1-2'
                  WHEN turn_count <= 5  THEN '3-5'
                  WHEN turn_count <= 15 THEN '6-15'
                  WHEN turn_count <= 50 THEN '16-50'
-                 WHEN turn_count <= 200 THEN '51-200'
+                 WHEN s.turn_count <= 200 THEN '51-200'
                  ELSE '200+' END bucket,
                COUNT(*) n
-        FROM session GROUP BY bucket""").fetchall()
+        FROM session s WHERE {LIVE} GROUP BY bucket""").fetchall()
     order = ["0", "1-2", "3-5", "6-15", "16-50", "51-200", "200+"]
     found = {r["bucket"]: r["n"] for r in rows}
     return {"labels": order, "values": [found.get(b, 0) for b in order]}
@@ -457,6 +493,37 @@ def hygiene(con) -> dict:
         [r["model_primary"] for r in con.execute(
             "SELECT model_primary FROM session")])
     return {"runs": [dict(r) for r in runs], "pricing_coverage": unpriced}
+
+
+def lineage(con) -> dict:
+    """The continuations found, and what excluding them took off the totals.
+
+    Reported rather than applied silently. Every message and token figure on the page is
+    now smaller than the obvious `COUNT(*)` over the same table, and a number that quietly
+    disagrees with the one you would get by hand is the kind of thing you re-derive from
+    scratch six months later wondering which is broken.
+    """
+    pairs = con.execute("""
+        SELECT c.id AS child_id, c.title AS child_title, c.continues_overlap AS overlap,
+               p.id AS parent_id, p.title AS parent_title,
+               COALESCE(p.tok_out,0) AS tok_out,
+               COALESCE(p.tok_cache_read,0) AS cache_read,
+               c.continues_overlap >= (SELECT COUNT(*) FROM message m2
+                                        WHERE m2.session_id = p.id
+                                          AND m2.on_active_path = 1) AS whole
+        FROM session c JOIN session p ON p.id = c.continues_session_id
+        ORDER BY c.continues_overlap DESC""").fetchall()
+    rows = [dict(r) for r in pairs]
+    merged = sum(1 for r in rows if r["whole"])
+    return {
+        "pairs": rows,
+        "continuations": len(rows),
+        # sessions that stopped counting as separate conversations
+        "merged": merged,
+        "superseded_messages": sum(r["overlap"] for r in rows),
+        "excluded_tok_out": sum(r["tok_out"] for r in rows if r["whole"]),
+        "excluded_cache_read": sum(r["cache_read"] for r in rows if r["whole"]),
+    }
 
 
 def _has_index(con) -> bool:
@@ -576,6 +643,8 @@ def everything(con) -> dict:
         "shape": session_shape(con),
         "hygiene": hygiene(con),
         "index": index_health(con),
+        # What the counts above had to leave out to stop describing one conversation twice.
+        "lineage": lineage(con),
         # Both are questions about the archive's *upkeep* rather than its contents,
         # and both are invisible from the charts: a source whose export stopped
         # arriving simply flattens out in the volume bars, which reads as a quiet

@@ -33,6 +33,12 @@ that is worth embedding, fused by weighted RRF. Both are needed: on paraphrased 
 the reason this project exists — BM25 alone finds the right session first once in nine
 tries. Multilingual model, so an English query finds a Slovene conversation.
 
+**Grouping you do not have to maintain.** Sessions are clustered into topic groups from
+their own embeddings and labelled from their own vocabulary, so browsing by subject works
+without anyone tagging anything. And a conversation resumed into a fresh transcript --
+Claude Code's `--resume` does this -- is detected and linked, so two session rows that are
+one conversation say so, and the replayed half stops being counted twice on the dashboard.
+
 **Runs entirely offline,** with one deliberate exception. The embedding model is local
 (118M params, ONNX, CPU). No API keys, no cloud, no telemetry. The web UI binds to
 `127.0.0.1` and vendors nothing from a CDN. The exception is `fetch-images`: T3 Chat
@@ -45,7 +51,8 @@ bytes are in the blob store before anything renders.
 credentials are stored and no session is fetched on your behalf.
 
 **Local web UI.** `llma serve` — faceted browse by source / workspace / model / machine /
-tag, full transcript view, and a statistics dashboard with token and cost breakdowns.
+topic / tag, full transcript view with a related-sessions panel, and a statistics dashboard
+with token and cost breakdowns.
 
 **Back to where it came from.** Every session links to the live conversation: the chat in
 your browser, the workspace in VS Code, or a terminal opened in the directory that agent
@@ -140,6 +147,8 @@ Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
 llma show 412 --tools             # one session as a transcript
 llma show 412 --json              # ... as a JSON document
 llma related 412                  # sessions most like it; the session is the query
+llma topics                       # the derived topic groups, largest first
+llma search "vlan" --topic packet-tracer-vlan
 llma open 412                     # reopen it: browser, VS Code, or a resumed terminal
 llma open 412 --print             # ... just say where it lives, and open nothing
 
@@ -181,6 +190,8 @@ llma stats                        # what's in the archive
 | Command | |
 |---|---|
 | `llma redact` | find secrets in stored text; `--apply` to rewrite, `--enable` for every future ingest |
+| `llma topics --rebuild` | recompute the derived topic groups; `--threshold` retunes how broad they are |
+| `llma lineage` | re-detect resumed sessions that replay an earlier transcript |
 | `llma validate` | check the message DAG for structural corruption |
 | `llma doctor` | report record types no adapter handled |
 | `llma browser` | opt-in: read OpenRouter's chats from its own browser IndexedDB store |

@@ -75,6 +75,12 @@ _FILTERS = {
         "type": "string",
         "description": "Exact machine tag, for an archive holding several machines.",
     },
+    "topic": {
+        "type": "string",
+        "description": "Slug of a derived topic group -- clusters of sessions about the "
+                       "same thing, named from their own vocabulary. Not user-assigned "
+                       "tags. Sessions resembling nothing else belong to no group.",
+    },
     "since": {"type": "string", "description": "Only sessions on or after YYYY-MM-DD."},
     "until": {"type": "string", "description": "Only sessions on or before YYYY-MM-DD."},
     "include_abandoned": {
@@ -244,6 +250,7 @@ def _filters(args: dict) -> Filters:
                    participant=args.get("participant"),
                    workspace=args.get("workspace"),
                    host=args.get("host"),
+                   topic=args.get("topic"),
                    since=api.parse_day(args.get("since")),
                    until=api.parse_day(args.get("until")),
                    include_abandoned=bool(args.get("include_abandoned")))
