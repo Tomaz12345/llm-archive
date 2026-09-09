@@ -125,7 +125,7 @@
                 {% if item.r.participant %}<span class="chip">{{ item.r.participant }}</span>{% endif %}</td>
             <td>{{ item.r.model_primary or "—" }}
                 {% if item.model_type %}<span class="tag type-{{ item.model_type }}">{{ item.model_type }}</span>{% endif %}</td>
-            <td>{{ item.r.workspace or "—" }}</td>
+            <td>{% if item.r.workspace %}<a href="/workspace/{{ item.r.workspace|urlencode }}" title="everything this project touched">{{ item.r.workspace }}</a>{% else %}—{% endif %}</td>
             <td>{{ item.r.host or "—" }}</td>
             <td class="num">{{ item.r.msg_count }}</td>
             <td class="num">{{ item.when }}</td>

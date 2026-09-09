@@ -101,6 +101,7 @@ from ..core.models import (
     KIND_THINKING,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -506,10 +507,11 @@ class GrokAdapter:
                                       embed_eligible=True))
             elif tag == TAG_TOOL_CARD:
                 for card_id, name, args in cards:
-                    parts.append(Part(
+                    parts.append(attach_tool_input(Part(
                         kind=KIND_TOOL_USE, seq=0, tool_name=name,
                         # Nothing in this format flags success or failure.
-                        tool_ok=None, text=args or None, embed_eligible=False))
+                        tool_ok=None, text=args or None, embed_eligible=False),
+                        args, self.blobs))
                     if card_id in results:
                         parts.extend(self._result_parts(results.pop(card_id), name,
                                                         stats))

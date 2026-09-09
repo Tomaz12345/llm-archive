@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import sqlite3
 
+import json
 import pytest
 from starlette.testclient import TestClient
 
 from llm_archive.core import db, reopen
 from llm_archive.core.models import Message, Part, Session
-from llm_archive.search import fts
+from llm_archive.search import facts, fts
 from llm_archive.web.app import _highlight, create_app
 
 
@@ -72,8 +73,50 @@ def client(tmp_path, monkeypatch):
         ("user", "fix the failing test", "text"),
         ("assistant", "fixed", "text")],
         meta={"cwds": {str(tmp_path): 4}})
+    # Two workspace rows under ONE label, on two machines -- the merge the workspace
+    # page has to show rather than hide. A path containing markup is here on purpose:
+    # a path is arbitrary archive text on its way into HTML.
+    def add_files(native, title, calls, ws_key, ws_label, host, source=None,
+                  kind="claude_code"):
+        msgs = []
+        for i, (tool, path) in enumerate(calls):
+            m = Message(native_id=f"{native}-{i}", role="assistant", seq=i,
+                        created_at=1771200000000 + i * 1000)
+            part = Part(kind="tool_use", seq=0, text=f"file_path: {path}",
+                        tool_name=tool)
+            part.tool_input = json.dumps({"file_path": path})
+            m.parts.append(part)
+            msgs.append(m)
+        db.upsert_session(con, source if source is not None else src, Session(
+            source_kind=kind, native_id=native, title=title,
+            workspace_key=ws_key, workspace_label=ws_label, host=host,
+            started_at=1771200000000, raw_path=f"/raw/{native}.jsonl",
+            raw_hash=native, messages=msgs))
+
+    add_files("w1", "Trained on the box", [
+        ("Edit", "/home/t/vision/code/train.py"),
+        ("Read", "/home/t/vision/code/train.py"),
+    ], "ssh-remote+jon/home/t/vision", "vision", "jon")
+    add_files("w2", "Trained on Windows", [
+        ("Edit", r"C:/proj/vision/code/train.py"),
+        ("Write", r"C:/proj/vision/<script>alert(1)</script>.py"),
+    ], "c:/proj/vision", "vision", "box")
+
+    cmd_msg = Message(native_id="cmd-0", role="assistant", seq=0,
+                      created_at=1771200000000)
+    cmd_part = Part(kind="tool_use", seq=0, text="command: pytest -q",
+                    tool_name="Bash")
+    cmd_part.tool_input = json.dumps({"command": "pytest -q tests/"})
+    cmd_msg.parts.append(cmd_part)
+    db.upsert_session(con, src, Session(
+        source_kind="claude_code", native_id="w3", title="Ran the tests",
+        workspace_key="c:/proj/vision", workspace_label="vision", host="box",
+        started_at=1771200000000, raw_path="/raw/w3.jsonl", raw_hash="w3",
+        messages=[cmd_msg]))
+
     con.commit()
     fts.rebuild(con)
+    facts.rebuild(con)
     con.close()
 
     return TestClient(create_app(data))
@@ -513,3 +556,78 @@ def test_stats_reports_what_lineage_removed(client, tmp_path):
     assert r.status_code == 200
     assert "Continued sessions" in r.text
     assert "continuation" in r.text
+
+
+# --- derived tool facts on the web -------------------------------------------
+
+def test_the_session_page_lists_the_files_it_touched(client):
+    """The panel is the shortest path from a transcript to what it actually did."""
+    sid = _session_id(client, "Trained on Windows")
+    body = client.get(f"/session/{sid}").text
+    assert "Files touched" in body
+    assert "code/train.py" in body
+
+
+def test_the_session_page_links_each_file_to_the_workspace(client):
+    """One click from "this session edited train.py" to everything that touched it."""
+    sid = _session_id(client, "Trained on Windows")
+    body = client.get(f"/session/{sid}").text
+    assert "/workspace/vision?file=" in body
+
+
+def test_the_session_page_survives_an_unindexed_archive(client, tmp_path):
+    """`_files_panel` returns [] rather than 500ing a page whose job is the transcript."""
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "data" / "archive.db")
+    con.execute("DROP TABLE touched_file")
+    con.execute("DROP TABLE command")
+    con.commit()
+    con.close()
+    sid = _session_id(client, "Trained on Windows")
+    assert client.get(f"/session/{sid}").status_code == 200
+
+
+def test_the_workspace_page_merges_two_roots_under_one_label(client):
+    """`vision` is an SSH box and a Windows checkout. Both are named, and their
+    `code/train.py` is ONE hot-file row -- that merge is why `rel` exists."""
+    body = client.get("/workspace/vision").text
+    assert "ssh-remote+jon/home/t/vision" in body
+    assert "c:/proj/vision" in body
+    # Once in the hot-file table -- the chart names it too, hence the anchor.
+    assert body.count(">code/train.py</a>") == 1
+    assert "2 machines" in body
+
+
+def test_the_workspace_page_can_narrow_to_one_root(client):
+    body = client.get("/workspace/vision?key=c:/proj/vision").text
+    assert "Trained on Windows" in body
+    assert "Trained on the box" not in body
+
+
+def test_the_workspace_page_filters_sessions_by_file(client):
+    body = client.get("/workspace/vision?file=code/train.py").text
+    assert "Trained on Windows" in body and "Trained on the box" in body
+    assert "Ran the tests" not in body
+
+
+def test_the_workspace_page_shows_what_gets_run(client):
+    assert "pytest" in client.get("/workspace/vision").text
+
+
+def test_the_workspace_page_404s_for_an_unknown_label(client):
+    assert client.get("/workspace/nosuchproject").status_code == 404
+
+
+def test_a_path_containing_markup_is_escaped_on_the_workspace_page(client):
+    """A path is arbitrary text from someone else's disk on its way into HTML."""
+    body = client.get("/workspace/vision").text
+    assert "<script>alert(1)</script>" not in body
+    assert "&lt;script&gt;" in body
+
+
+def _session_id(client, title: str) -> int:
+    import re
+    body = client.get("/browse").text
+    match = re.search(r'href="/session/(\d+)">' + re.escape(title), body)
+    assert match, f"{title!r} not on /browse"
+    return int(match.group(1))

@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="/static/app.css?v={{ asset_v }}">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🗄️</text></svg>">
 </head>
-<body class="{% if request.url.path.startswith('/session/') %}page-reader{% elif request.url.path == '/stats' %}page-dash{% else %}page-layout{% endif %}">
+<body class="{% if request.url.path.startswith('/session/') %}page-reader{% elif request.url.path == '/stats' or request.url.path.startswith('/workspace/') %}page-dash{% else %}page-layout{% endif %}">
 <header class="topbar">
   <div class="topbar-inner">
     <a class="brand" href="/">Session&nbsp;Archive</a>

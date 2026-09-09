@@ -39,6 +39,7 @@ from ..core.models import (
     KIND_TEXT,
     KIND_THINKING,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -73,6 +74,26 @@ RESPONDERS = {"github copilot": ("copilot", "GitHub Copilot")}
 
 # `selectedModel.metadata.vendor`, the weakest signal — present on a dozen sessions.
 VENDORS = {"copilot": "GitHub Copilot"}
+
+
+# Tools whose edited path has to be recovered from the edit group that follows them.
+WRITE_TOOLS = frozenset({"copilot_applyPatch", "copilot_replaceString",
+                         "copilot_multiReplaceString", "copilot_createFile",
+                         "copilot_insertEdit", "copilot_editFile"})
+
+
+def _attach_edited_uri(part: Part, uri: dict) -> None:
+    """Record, on the call, the file the following edit group says it changed."""
+    if not part.tool_input:
+        return
+    try:
+        payload = json.loads(part.tool_input)
+    except ValueError:
+        return                      # offloaded and truncated; the blob still has it
+    if not isinstance(payload, dict):
+        return
+    payload.setdefault("editedUris", []).append(uri)
+    part.tool_input = json.dumps(payload, ensure_ascii=False, default=str)
 
 
 class VSCodeChatAdapter:
@@ -232,12 +253,33 @@ class VSCodeChatAdapter:
                             (f"{req.get('requestId')}:r" if req.get("requestId") else None),
                             role="assistant", created_at=when, seq=seq,
                             model=req.get("modelId") or model_name)
+            # A write tool records no path of its own: 0 of 354 `copilot_applyPatch`
+            # blocks carry `uris`. The path arrives afterwards, in the `textEditGroup`
+            # that VS Code emits per edit. Within one request the two run in step --
+            # 65 requests pair 1:1, 19 pair 2:2, and one pairs 12:12 -- so they are
+            # zipped by position rather than tracked with a single "last write" cursor,
+            # which would keep only the last of each run and drop ~40% of the writes.
+            #
+            # A count mismatch truncates to the common prefix: for this table a missing
+            # row is cheap and a row blamed on the wrong file is not.
+            writes: list[Part] = []
+            edited: list[dict] = []
             for blk in req.get("response") or []:
                 if not isinstance(blk, dict):
                     continue
+                if blk.get("kind") in ("textEditGroup", "notebookEditGroup"):
+                    uri = blk.get("uri")
+                    if isinstance(uri, dict):
+                        edited.append(uri)
+                    continue
                 part = self._build_part(blk, len(reply.parts), stats)
-                if part is not None:
-                    reply.parts.append(part)
+                if part is None:
+                    continue
+                reply.parts.append(part)
+                if part.tool_name in WRITE_TOOLS and part.kind == KIND_TOOL_USE:
+                    writes.append(part)
+            for part, uri in zip(writes, edited):
+                _attach_edited_uri(part, uri)
             if reply.parts:
                 messages.append(reply)
                 seq += 1
@@ -320,17 +362,53 @@ class VSCodeChatAdapter:
             label = blk.get("invocationMessage") or blk.get("pastTenseMessage")
             if isinstance(label, dict):
                 label = label.get("value")
-            return Part(
+
+            # The panel records no `input` for a tool call, so the payload is assembled
+            # from what it DOES carry. Two pieces do real work downstream:
+            #
+            # `uris` is the only place a path appears -- the label is prose ("Reading
+            # train.py, lines 155 to 165"). Each entry is a {path, scheme, authority}
+            # object, so a file on the SSH box stays distinct from its Windows twin.
+            #
+            # `phase` separates the pre-announcement from the completed record. VS Code
+            # writes BOTH for every call (1,167 and 1,230 blocks in this archive), and
+            # the derivation counts only the completed one -- otherwise every file the
+            # panel ever touched is counted twice.
+            uris = []
+            for source in (blk.get("invocationMessage"), blk.get("pastTenseMessage")):
+                if isinstance(source, dict):
+                    uris.extend((source.get("uris") or {}).values())
+            terminal = blk.get("toolSpecificData")
+
+            # `isComplete` is true for a command that exited 127, so where the terminal
+            # records an exit code, that is the honest answer.
+            ok = blk.get("isComplete") if "isComplete" in blk else None
+            if isinstance(terminal, dict):
+                state = terminal.get("terminalCommandState")
+                if isinstance(state, dict) and isinstance(state.get("exitCode"), int):
+                    ok = state["exitCode"] == 0
+
+            payload = {"toolId": str(name),
+                       "toolCallId": blk.get("toolCallId"),
+                       "phase": ("complete" if kind == "toolInvocationSerialized"
+                                 else "prepare"),
+                       "label": label,
+                       "uris": uris,
+                       "terminal": terminal}
+            return attach_tool_input(Part(
                 kind=KIND_TOOL_USE, seq=seq, tool_name=str(name),
                 text=str(label)[:300] if label else "",
-                tool_ok=blk.get("isComplete") if "isComplete" in blk else None,
+                tool_ok=ok,
                 bytes=len(json.dumps(blk, default=str)),
-                embed_eligible=True)
+                embed_eligible=True), payload, self.blobs)
 
         # Structural/editor chrome carries no conversational value. `elicitation` is a
         # modal asking the user to decide something ("Continue waiting?"), the same
         # class of thing as `confirmation`; the *Serialized suffixes are the persisted
         # forms of blocks whose live variants are already here.
+        # `textEditGroup`/`notebookEditGroup` are consumed by the response loop before
+        # they reach here -- they name the file a patch wrote. They stay off this list
+        # only in the sense that the loop never passes them in.
         if kind in ("undoStop", "mcpServersStarting", "codeblockUri", "inlineReference",
                     "textEditGroup", "progressMessage", "progressTask", "codeCitation",
                     "command", "confirmation", "warning", "notebookEdit", "extensions",

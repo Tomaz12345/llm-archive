@@ -21,7 +21,7 @@ from .models import TURN_KINDS, Session
 # MIGRATIONS[6] adds to an existing one.
 from .redact import MIGRATION as REDACTION_DDL
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # v10. Derived topic groups, rebuilt wholesale by `llma topics` / the tail of `llma index`.
 #
@@ -32,6 +32,61 @@ SCHEMA_VERSION = 10
 # belongs to one group or to none. Sessions with no chunks (nothing embeddable, or indexed
 # with --no-vectors) simply get no row and read as unclustered, which is honest — the
 # alternative is a group that means "we had nothing to go on".
+# v11. What the tool calls actually did, derived from `part.tool_input` at index time.
+#
+# Shared by SCHEMA and MIGRATIONS[11] for the reason TOPIC_DDL is: migrations only run on
+# an EXISTING database, so a table written only there never reaches a fresh archive.
+#
+# Both are DERIVED and rebuilt wholesale by search/facts.py, exactly as part_fts is. That
+# is why neither carries a UNIQUE constraint: a rebuild would turn a duplicate into an
+# IntegrityError halfway through an index run, where a Python-side dedup costs nothing.
+# ON DELETE CASCADE on part_id is the other half — ingest deletes and re-inserts a
+# re-parsed message's parts, renumbering part.id, so the rows for a stale call go with
+# it. These tables are therefore as stale as the last `llma index`, and never staler
+# than the last ingest.
+TOUCHED_FILE_DDL = """
+CREATE TABLE IF NOT EXISTS touched_file (
+  id           INTEGER PRIMARY KEY,
+  part_id      INTEGER NOT NULL REFERENCES part(id) ON DELETE CASCADE,
+  -- denormalised: every read of this table is "which sessions", and the alternative is
+  -- a three-table join on the hot path
+  session_id   INTEGER NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+  workspace_id INTEGER REFERENCES workspace(id),
+  at           INTEGER NOT NULL,          -- message.created_at
+  action       TEXT NOT NULL,             -- read|write|edit|delete|search|list|other
+  tool_name    TEXT,                      -- kept so a surprising row can be explained
+  ok           INTEGER,                   -- an Edit that errored did not touch the file
+  path         TEXT NOT NULL,             -- the literal string the tool recorded
+  -- the match key: casefolded, forward slashes, dot segments resolved, and prefixed by
+  -- the host for anything remote, so /home/tomaz/x on two boxes stays two files
+  norm         TEXT NOT NULL,
+  base         TEXT NOT NULL,             -- final segment; `who-touched db.py` is an index hit
+  -- `norm` with the workspace key stripped. THIS is the cross-machine join key: it is
+  -- what makes code/train.py edited over SSH and on Windows one row of a hot-file list.
+  rel          TEXT,
+  host_key     TEXT                       -- ssh-remote+jon | wsl+ubuntu | github.com | NULL
+)"""
+
+COMMAND_DDL = """
+CREATE TABLE IF NOT EXISTS command (
+  id           INTEGER PRIMARY KEY,
+  part_id      INTEGER NOT NULL REFERENCES part(id) ON DELETE CASCADE,
+  session_id   INTEGER NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+  workspace_id INTEGER REFERENCES workspace(id),
+  at           INTEGER NOT NULL,
+  tool_name    TEXT,
+  shell        TEXT,                      -- posix | powershell | unknown
+  -- argv0 and its subcommand are stored apart from `text` because `git` alone is a
+  -- third of everything and says nothing; it is also what keeps `llma commands pytest`
+  -- from matching `git commit -m "fix pytest"`, and what makes the ranking indexable.
+  argv0        TEXT NOT NULL,
+  subcommand   TEXT,
+  text         TEXT NOT NULL,             -- the WHOLE command line, not a 300-char head
+  cwd          TEXT,
+  ok           INTEGER,
+  duration_ms  INTEGER
+)"""
+
 TOPIC_DDL = """
 CREATE TABLE IF NOT EXISTS topic (
   id        INTEGER PRIMARY KEY,
@@ -238,6 +293,18 @@ MIGRATIONS = {
          "ALTER TABLE message ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0",
          TOPIC_DDL,
          SESSION_TOPIC_DDL],
+    # v11: what the tool calls did. `part.text` has always held a 300-character line of
+    # intent -- "command: pytest -q ..." -- and the arguments themselves went on the
+    # floor, so 2,841 of 6,061 Bash calls were stored truncated and every VS Code tool
+    # row stored a UI label instead of a path. `part.tool_input` keeps the payload;
+    # `touched_file` and `command` are derived from it, wholesale, by search/facts.py.
+    #
+    # ALTER ... REFERENCES is legal here because the default is NULL; MIGRATIONS[10]'s
+    # `continues_session_id` sets the precedent and runs on the live database today.
+    11: ["ALTER TABLE part ADD COLUMN tool_input TEXT",
+         "ALTER TABLE part ADD COLUMN tool_input_blob_id INTEGER REFERENCES blob(id)",
+         TOUCHED_FILE_DDL,
+         COMMAND_DDL],
 }
 
 
@@ -338,7 +405,14 @@ CREATE TABLE IF NOT EXISTS part (
   redacted       INTEGER NOT NULL DEFAULT 0,
   -- tool_use only: wall-clock time to the matching tool_result, where the source
   -- timestamps both ends. NULL means "not timed", not "instant".
-  duration_ms    INTEGER
+  duration_ms    INTEGER,
+  -- tool_use only: the call's arguments as JSON, as the source recorded them. `text`
+  -- is a short line of intent for a human and for FTS; this is what the derived tables
+  -- are computed from. Over INLINE_LIMIT it holds a head excerpt and the blob has the
+  -- whole thing -- deliberately NOT `blob_id`, which already means "the full text of
+  -- this part" and would make the viewer render arguments as the part body.
+  tool_input     TEXT,
+  tool_input_blob_id INTEGER REFERENCES blob(id)
 );
 
 CREATE TABLE IF NOT EXISTS blob (
@@ -428,7 +502,7 @@ CREATE TABLE IF NOT EXISTS drop_file (
 );
 CREATE INDEX IF NOT EXISTS idx_drop_kind ON drop_file(kind);
 
-""" + TOPIC_DDL + ";" + SESSION_TOPIC_DDL + """;
+""" + TOPIC_DDL + ";" + SESSION_TOPIC_DDL + ";"     + TOUCHED_FILE_DDL + ";" + COMMAND_DDL + """;
 
 CREATE INDEX IF NOT EXISTS idx_session_raw_path ON session(raw_path);
 CREATE INDEX IF NOT EXISTS idx_session_time   ON session(started_at);
@@ -456,6 +530,13 @@ POST_SCHEMA = [
          WHERE continues_session_id IS NOT NULL""",
     "CREATE INDEX IF NOT EXISTS idx_msg_superseded ON message(session_id, superseded)",
     "CREATE INDEX IF NOT EXISTS idx_session_topic_topic ON session_topic(topic_id)",
+    "CREATE INDEX IF NOT EXISTS idx_touched_base    ON touched_file(base)",
+    "CREATE INDEX IF NOT EXISTS idx_touched_norm    ON touched_file(norm)",
+    "CREATE INDEX IF NOT EXISTS idx_touched_session ON touched_file(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_touched_ws      ON touched_file(workspace_id, rel)",
+    "CREATE INDEX IF NOT EXISTS idx_command_argv0   ON command(argv0)",
+    "CREATE INDEX IF NOT EXISTS idx_command_session ON command(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_command_ws      ON command(workspace_id)",
 ]
 
 
@@ -693,12 +774,18 @@ def upsert_session(con: sqlite3.Connection, src: int, sess: Session) -> MergeRes
             bid = None
             if part.blob_sha and part.blob_path:
                 bid = blob_id(con, part.blob_sha, part.bytes, part.blob_path)
+            tbid = None
+            if part.tool_input_sha and part.tool_input_path:
+                tbid = blob_id(con, part.tool_input_sha, part.tool_input_bytes,
+                               part.tool_input_path)
             con.execute(
                 "INSERT INTO part(message_id,seq,kind,text,blob_id,tool_name,tool_ok,"
-                "bytes,embed_eligible,duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "bytes,embed_eligible,duration_ms,tool_input,tool_input_blob_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mid, part.seq, part.kind, part.text, bid, part.tool_name,
                  None if part.tool_ok is None else int(part.tool_ok),
-                 part.bytes, int(part.embed_eligible), part.duration_ms))
+                 part.bytes, int(part.embed_eligible), part.duration_ms,
+                 part.tool_input, tbid))
 
     # Whatever is left in `stored` is a message the archive holds and this snapshot did
     # not mention. It stays. `absent_since` is stamped only the first time it goes

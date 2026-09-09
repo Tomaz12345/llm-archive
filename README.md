@@ -33,6 +33,15 @@ that is worth embedding, fused by weighted RRF. Both are needed: on paraphrased 
 the reason this project exists — BM25 alone finds the right session first once in nine
 tries. Multilingual model, so an English query finds a Slovene conversation.
 
+**What the sessions actually did, not just what they said.** Every tool call's
+arguments are kept, and two tables are derived from them at index time: which files were
+read, written and edited, and which shell commands were run. So `llma who-touched
+src/db.py` answers *why is this code like this* by naming the conversations that produced
+it, and `llma commands "alembic upgrade"` is a cross-agent shell history with the
+surrounding conversation still attached — 7,000 commands here, kept whole rather than
+truncated to a preview. Paths are normalised across Windows, WSL and remote SSH, so a
+file edited from two machines is one row and not two.
+
 **Grouping you do not have to maintain.** Sessions are clustered into topic groups from
 their own embeddings and labelled from their own vocabulary, so browsing by subject works
 without anyone tagging anything. And a conversation resumed into a fresh transcript --
@@ -51,8 +60,9 @@ bytes are in the blob store before anything renders.
 credentials are stored and no session is fetched on your behalf.
 
 **Local web UI.** `llma serve` — faceted browse by source / workspace / model / machine /
-topic / tag, full transcript view with a related-sessions panel, and a statistics dashboard
-with token and cost breakdowns.
+topic / tag, full transcript view with a related-sessions panel and the files that session
+touched, a per-project page with its hot files and the commands run there, and a
+statistics dashboard with token and cost breakdowns.
 
 **Back to where it came from.** Every session links to the live conversation: the chat in
 your browser, the workspace in VS Code, or a terminal opened in the directory that agent
@@ -152,6 +162,12 @@ llma search "vlan" --topic packet-tracer-vlan
 llma open 412                     # reopen it: browser, VS Code, or a resumed terminal
 llma open 412 --print             # ... just say where it lives, and open nothing
 
+llma who-touched db.py            # the sessions that opened this file
+llma who-touched core/db.py --writes   # ... only the ones that changed it
+llma commands                     # what you actually run, ranked
+llma commands "alembic upgrade"   # every time you ran it, and where
+llma commands -p git --workspace payments-api
+
 llma serve                        # web UI on http://127.0.0.1:8787
 llma serve --no-fetch-images      # ... without the startup image backfill
 
@@ -167,10 +183,11 @@ llma export --workspace payments-api --zip --out ./out
 claude mcp add llm-archive -- llma mcp
 ```
 
-That registers a stdio MCP server with three read-only tools — `search`, `show`,
-`related` — over the same hybrid retrieval the CLI uses. The point is the session you
-are in the middle of: last March's fix for this exact stack trace is already in the
-archive, and now the agent can find it without being told it exists.
+That registers a stdio MCP server with five read-only tools — `search`, `show`,
+`related`, `who_touched` and `commands` — over the same retrieval the CLI uses. The point
+is the session you are in the middle of: last March's fix for this exact stack trace is
+already in the archive, and now the agent can find it without being told it exists. Give
+it a path and it can read the conversations that wrote the file it is about to change.
 
 `llma mcp` is meant to be spawned by the client, not run by hand; it speaks JSON-RPC on
 stdin and stdout and opens no socket. Add `--data-dir` if your archive is not in the

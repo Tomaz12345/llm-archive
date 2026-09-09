@@ -12,7 +12,7 @@
       {% endif %}
       {% if meta.participant %}<span class="chip">{{ meta.participant }}</span>{% endif %}
       <span>{{ when }}</span>
-      {% if meta.workspace %}<span>· {{ meta.workspace }}</span>{% endif %}
+      {% if meta.workspace %}<span>· <a href="/workspace/{{ meta.workspace|urlencode }}" title="everything this project touched">{{ meta.workspace }}</a></span>{% endif %}
       {% if meta.host %}<span>· {{ meta.host }}</span>{% endif %}
       {% if meta.model_primary %}<span>· {{ meta.model_primary }}</span>
         {% if model_type %}<span class="tag type-{{ model_type }}">{{ model_type }}</span>{% endif %}
@@ -207,6 +207,41 @@
     </nav>
   {% endif %}
 
+  {# What the session DID, from the tool calls themselves. The link on each file is
+     the point: one click from "this session edited train.py" to everything that ever
+     touched it. #}
+  {% if files or commands %}
+    <section class="panel">
+      <h2>Files touched</h2>
+      <p class="sub">Derived from this session&rsquo;s tool calls at index time.</p>
+      {% if files %}
+        <div class="scrollx">
+          <table class="grid">
+            <tr><th>File</th><th>What</th><th class="num">Calls</th><th>Last</th></tr>
+            {% for f in files %}
+              <tr>
+                <td>
+                  {% if meta.workspace %}
+                    <a href="/workspace/{{ meta.workspace|urlencode }}?file={{ f.key|urlencode }}"
+                       title="{{ f.path }}">{{ f.key }}</a>
+                  {% else %}<span title="{{ f.path }}">{{ f.key }}</span>{% endif %}
+                </td>
+                <td>{% for a in f.actions %}<span class="chip">{{ a }}</span>{% endfor %}</td>
+                <td class="num">{{ f.calls }}</td>
+                <td>{{ f.last_at[:10] if f.last_at }}</td>
+              </tr>
+            {% endfor %}
+          </table>
+        </div>
+      {% endif %}
+      {% if commands %}
+        <p class="sub">Programs run:
+          {% for c in commands %}<span class="chip">{{ c.program }} &times;{{ c.runs }}</span>{% endfor %}
+        </p>
+      {% endif %}
+    </section>
+  {% endif %}
+
   {# Derived on the spot from this session's own vectors and opening turns — nothing is
      stored, so it follows the archive as it grows. Absent rather than empty when there is
      no index to ask. #}
@@ -222,7 +257,7 @@
           <div class="hit-meta">
             <span class="chip src-{{ h.source }}">{{ h.source }}</span>
             <span>{{ item.when }}</span>
-            {% if h.workspace %}<span>· {{ h.workspace }}</span>{% endif %}
+            {% if h.workspace %}<span>· <a href="/workspace/{{ h.workspace|urlencode }}" title="everything this project touched">{{ h.workspace }}</a></span>{% endif %}
             {% if h.host %}<span>· {{ h.host }}</span>{% endif %}
             <span class="match match-{{ h.matched_by }}" title="which retriever found it">
               {{ h.matched_by }}

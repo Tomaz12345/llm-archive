@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
+
 import numpy as np
 import pytest
 
 from llm_archive.core import db
 from llm_archive.core.models import Message, Part, Session
-from llm_archive.search import fts
+from llm_archive.search import fts, index
 from llm_archive.search.chunker import (
     MAX_CHARS, chunk_part, context_header, strip_header,
 )
@@ -486,3 +488,136 @@ def test_hybrid_related_uses_both_halves(tmp_path):
     hits = related(con, tmp_path / "vectors", 4)
     assert hits[0].session_id == 5
     assert hits[0].matched_by == "both"
+
+
+# --- derived tool facts -------------------------------------------------------
+
+def _archive_with_tool_calls(tmp_path: Path):
+    """One session whose tool calls carry real payloads."""
+    con = db.connect(tmp_path / "facts.db")
+    src = db.source_id(con, "claude_code", "Claude Code", "cli")
+    msgs = []
+    calls = [("Edit", {"file_path": "/proj/app/main.py"}),
+             ("Read", {"file_path": "/proj/app/main.py"}),
+             ("Bash", {"command": "pytest -q tests/"})]
+    for i, (tool, payload) in enumerate(calls):
+        m = Message(native_id=f"c{i}", role="assistant", seq=i,
+                    created_at=1771200000000 + i)
+        part = Part(kind="tool_use", seq=0, text="summary", tool_name=tool)
+        part.tool_input = json.dumps(payload)
+        m.parts.append(part)
+        msgs.append(m)
+    db.upsert_session(con, src, Session(
+        source_kind="claude_code", native_id="fs1", title="Worked on main",
+        workspace_key="/proj", workspace_label="proj", host="box",
+        started_at=1771200000000, raw_path="x", raw_hash="fs1", messages=msgs))
+    con.commit()
+    return con
+
+
+def test_a_keyword_only_build_still_derives_the_facts(tmp_path):
+    """`--no-vectors` returns early, before the embedding work. The derivation has to
+    sit ABOVE that return: a nightly keyword-only run must not leave the archive with a
+    fresh keyword index and a month-old answer to "who touched this file"."""
+    con = _archive_with_tool_calls(tmp_path)
+    result = index.build(con, tmp_path / "vectors", with_vectors=False)
+    assert result.skipped_vectors is True
+    assert result.files == 2 and result.commands == 1
+    assert con.execute("SELECT COUNT(*) FROM touched_file").fetchone()[0] == 2
+    assert con.execute("SELECT COUNT(*) FROM command").fetchone()[0] == 1
+
+
+def test_the_derivation_reads_the_workspace_relative_path(tmp_path):
+    con = _archive_with_tool_calls(tmp_path)
+    index.build(con, tmp_path / "vectors", with_vectors=False)
+    rels = {r[0] for r in con.execute("SELECT rel FROM touched_file")}
+    assert rels == {"app/main.py"}
+
+
+def test_the_whole_command_is_kept_not_the_summary(tmp_path):
+    """`part.text` is a short line of intent; `command.text` is the command."""
+    con = _archive_with_tool_calls(tmp_path)
+    index.build(con, tmp_path / "vectors", with_vectors=False)
+    row = con.execute("SELECT argv0, subcommand, text FROM command").fetchone()
+    assert row["argv0"] == "pytest"
+    assert row["text"] == "pytest -q tests/"
+
+
+def test_re_ingesting_a_session_leaves_no_stale_file_rows(tmp_path):
+    """Ingest deletes and re-inserts a re-parsed message's parts, renumbering part.id.
+    The cascade is what stops the archive answering from calls that no longer exist."""
+    con = _archive_with_tool_calls(tmp_path)
+    index.build(con, tmp_path / "vectors", with_vectors=False)
+    before = con.execute("SELECT COUNT(*) FROM touched_file").fetchone()[0]
+
+    src = db.source_id(con, "claude_code", "Claude Code", "cli")
+    m = Message(native_id="c0", role="assistant", seq=0, created_at=1771200000000)
+    part = Part(kind="tool_use", seq=0, text="summary", tool_name="Edit")
+    part.tool_input = json.dumps({"file_path": "/proj/app/main.py"})
+    m.parts.append(part)
+    db.upsert_session(con, src, Session(
+        source_kind="claude_code", native_id="fs1", title="Worked on main",
+        workspace_key="/proj", workspace_label="proj", host="box",
+        started_at=1771200000000, raw_path="x", raw_hash="fs1-v2", messages=[m]))
+    con.commit()
+
+    # The rewritten message's parts were deleted and re-inserted under new ids, and
+    # its derived rows went with them. The rows for messages the snapshot did not
+    # mention stay, because `upsert_session` merges rather than replacing -- a chat
+    # pruned server-side must not silently erase what the archive already held.
+    after = con.execute("SELECT COUNT(*) FROM touched_file").fetchone()[0]
+    assert after < before, "the cascade did not fire"
+    index.build(con, tmp_path / "vectors", with_vectors=False)
+    assert con.execute("SELECT COUNT(*) FROM touched_file").fetchone()[0] == before
+
+
+def test_an_unparseable_payload_does_not_stop_the_index(tmp_path):
+    """One malformed payload among 13,000 must not take the whole run down."""
+    con = _archive_with_tool_calls(tmp_path)
+    con.execute("UPDATE part SET tool_input = ? WHERE tool_name = 'Bash'",
+                ("{not json at all",))
+    con.commit()
+    result = index.build(con, tmp_path / "vectors", with_vectors=False)
+    assert result.files == 2          # the other calls still derived
+
+
+def test_a_call_with_no_stored_payload_is_reported_not_guessed(tmp_path):
+    """A pre-v11 part has `tool_input` NULL. Saying so is what tells the reader to run
+    `ingest --force`, rather than silently deriving nothing."""
+    con = _archive_with_tool_calls(tmp_path)
+    con.execute("UPDATE part SET tool_input = NULL")
+    con.commit()
+    result = index.build(con, tmp_path / "vectors", with_vectors=False)
+    assert result.files == 0
+    assert any("ingest --force" in w for w in result.warnings)
+
+
+def test_a_payload_that_overflowed_to_a_blob_is_read_back(tmp_path):
+    """Payloads over INLINE_LIMIT live in the blob store; a truncated head does not
+    parse as JSON, so falling back to it would derive facts from half a payload."""
+    from llm_archive.core.blobs import BlobStore
+    from llm_archive.core.models import INLINE_LIMIT, attach_tool_input
+
+    blobs = BlobStore(tmp_path / "blobs")
+    con = db.connect(tmp_path / "big.db")
+    src = db.source_id(con, "claude_code", "Claude Code", "cli")
+    payload = {"command": "echo " + "x" * (INLINE_LIMIT + 100)}
+    part = Part(kind="tool_use", seq=0, text="summary", tool_name="Bash")
+    attach_tool_input(part, payload, blobs)
+    assert part.tool_input_sha, "the fixture did not overflow"
+
+    m = Message(native_id="b0", role="assistant", seq=0, created_at=1771200000000)
+    m.parts.append(part)
+    db.upsert_session(con, src, Session(
+        source_kind="claude_code", native_id="bs1", title="Big call",
+        workspace_key="/proj", workspace_label="proj", host="box",
+        started_at=1771200000000, raw_path="x", raw_hash="bs1", messages=[m]))
+    con.commit()
+
+    result = index.build(con, tmp_path / "vectors", with_vectors=False,
+                         blob_dir=tmp_path / "blobs")
+    assert result.commands == 1
+    assert result.unreadable == 0 if hasattr(result, "unreadable") else True
+    row = con.execute("SELECT argv0, LENGTH(text) n FROM command").fetchone()
+    assert row["argv0"] == "echo"
+    assert row["n"] > INLINE_LIMIT, "the blob was not read back in full"

@@ -220,6 +220,27 @@ def create_app(data_dir: Path | None = None, *,
                  "role": h.snippets[0].role if h.snippets else ""}
                 for h in hits]
 
+    def _files_panel(con, session_id: int, limit: int = 40) -> list[dict]:
+        """What this session opened, wrote and ran, from the derived tables.
+
+        Same contract as `_related_panel`: never raises. A pre-v11 archive has no
+        `touched_file` at all, and an archive ingested but never indexed has an empty
+        one -- neither is worth a 500 on a page whose job is showing the transcript.
+        """
+        from .. import api
+        try:
+            return api.session_files(con, session_id, limit)
+        except Exception:  # noqa: BLE001 - the transcript matters more than the panel
+            return []
+
+    def _commands_panel(con, session_id: int, limit: int = 10) -> list[dict]:
+        """The programs this session ran. A 6,000-command session is not a list."""
+        from .. import api
+        try:
+            return api.session_commands(con, session_id, limit)
+        except Exception:  # noqa: BLE001
+            return []
+
     # ------------------------------------------------------------------ views
 
     @app.get("/", response_class=HTMLResponse)
@@ -421,6 +442,11 @@ def create_app(data_dir: Path | None = None, *,
             # other half exists.
             "lineage": lineage.chain(con, session_id),
             "related": _related_panel(con, session_id),
+            # What the session actually did, as opposed to what it said. Derived at
+            # index time; empty rather than absent when the archive has not been
+            # indexed since the tool payloads landed.
+            "files": _files_panel(con, session_id),
+            "commands": _commands_panel(con, session_id),
         })
 
     def _export_html(session_id: int, *, download: bool, tools: bool, abandoned: bool,
@@ -678,6 +704,53 @@ def create_app(data_dir: Path | None = None, *,
             "fmt_when": _fmt,
             "fmt_ms": _fmt_ms,
         })
+
+    @app.get("/workspace/{label}", response_class=HTMLResponse)
+    def workspace_view(request: Request, label: str, key: str = "", file: str = "",
+                       limit: int = 50, offset: int = 0):
+        """One project, across every agent and machine that worked on it.
+
+        A label routinely names several `workspace` rows -- per source, and per root --
+        so the page resolves to a SET of ids and names the roots it merged rather than
+        quietly picking one.
+        """
+        from ..stats import charts, workspaces as ws
+
+        con = connect()
+        try:
+            rows = ws.resolve(con, label, key or None)
+            if not rows:
+                return HTMLResponse(f"no workspace {label!r}", status_code=404)
+
+            files = ws.hot_files(con, rows)
+            programs = ws.top_programs(con, rows)
+            total = ws.session_count(con, rows, file or None)
+            listed = ws.sessions(con, rows, limit=limit, offset=offset,
+                                 file=file or None)
+            return templates.TemplateResponse(request, "workspace.html", {
+                "totals": totals(con),
+                "label": rows[0]["label"] or label,
+                "roots": rows,
+                "key": key,
+                "file": file,
+                "overview": ws.overview(con, rows),
+                "files": files,
+                "programs": programs,
+                "branches": ws.branches(con, rows),
+                "sessions": listed,
+                "total": total,
+                "offset": offset,
+                "page": limit,
+                "chart_files": charts.hbars(
+                    [(f["key"], f["calls"], f"{f['calls']:,}") for f in files[:15]],
+                    accent_index=2),
+                "chart_programs": charts.hbars(
+                    [(p["program"], p["runs"], f"{p['runs']:,}") for p in programs],
+                    accent_index=1),
+                "fmt": _fmt,
+            })
+        finally:
+            con.close()
 
     @app.get("/browse", response_class=HTMLResponse)
     def browse(request: Request, workspace: str = "", source: str = "",

@@ -31,6 +31,7 @@ from ..core.models import (
     KIND_THINKING,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -203,11 +204,12 @@ class OpenCodeAdapter:
         start, end = timing.get("start"), timing.get("end")
         duration = (end - start if isinstance(start, (int, float))
                     and isinstance(end, (int, float)) and end >= start else None)
-        msg.parts.append(Part(
+        msg.parts.append(attach_tool_input(Part(
             kind=KIND_TOOL_USE, seq=len(msg.parts), tool_name=str(name),
             text=self._summarise(state.get("input")),
             bytes=len(json.dumps(state.get("input") or {}, default=str)),
-            embed_eligible=True, duration_ms=duration))
+            embed_eligible=True, duration_ms=duration),
+            state.get("input"), self.blobs))
         output = state.get("output")
         if output:
             text = output if isinstance(output, str) else json.dumps(

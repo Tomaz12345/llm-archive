@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}{{ label }} — Session Archive{% endblock %}
+
+{% block body %}
+<div class="dash">
+<h1>{{ label }}</h1>
+
+{# A label routinely names several workspace rows: per source, and per root. The merge
+   is shown rather than hidden, because "19 sessions" is only true if you can see that
+   15 of them ran on another machine. #}
+<p class="sub">
+  {{ "{:,}".format(overview.sessions or 0) }} sessions ·
+  {{ "{:,}".format(overview.turns or 0) }} turns
+  {% if roots|length > 1 %} · {{ roots|length }} roots{% endif %}
+  {% if overview.first_at %} · {{ fmt(overview.first_at) }} – {{ fmt(overview.last_at) }}{% endif %}
+</p>
+
+{% if roots|length > 1 or key %}
+  <section class="panel">
+    <h2>Roots</h2>
+    <div class="scrollx">
+      <table class="grid">
+        <tr><th>Path</th><th>Source</th><th class="num">Sessions</th><th></th></tr>
+        {% for r in roots %}
+          <tr>
+            <td>{{ r.key }}</td>
+            <td><span class="chip src-{{ r.source }}">{{ r.source }}</span></td>
+            <td class="num">{{ r.sessions }}</td>
+            <td>
+              {% if key %}<a href="/workspace/{{ label|urlencode }}">all roots</a>
+              {% else %}<a href="/workspace/{{ label|urlencode }}?key={{ r.key|urlencode }}">only this</a>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+  </section>
+{% endif %}
+
+{% if branches %}
+  <p class="sub">Branches:
+    {% for b in branches %}<span class="chip">{{ b.branch }}</span>{% endfor %}
+  </p>
+{% endif %}
+
+<section class="panel">
+  <h2>Hot files</h2>
+  <p class="sub">
+    Grouped by path relative to the project root, so the same file edited on two
+    machines is one row.
+  </p>
+  {% if files %}
+    <div class="scrollx">{{ chart_files|safe }}</div>
+    <div class="scrollx">
+      <table class="grid">
+        <tr><th>File</th><th class="num">Calls</th><th class="num">Writes</th>
+            <th class="num">Sessions</th><th>Last</th></tr>
+        {% for f in files %}
+          <tr>
+            <td><a href="/workspace/{{ label|urlencode }}?file={{ f.key|urlencode }}{% if key %}&key={{ key|urlencode }}{% endif %}"
+                   title="{{ f.path }}">{{ f.key }}</a>
+                {% if f.hosts > 1 %}<span class="chip">{{ f.hosts }} machines</span>{% endif %}</td>
+            <td class="num">{{ f.calls }}</td>
+            <td class="num">{{ f.writes }}</td>
+            <td class="num">{{ f.sessions }}</td>
+            <td>{{ fmt(f.last_at) }}</td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+  {% else %}
+    <p class="nodata">No file history yet — run <code>llma index</code>.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>What gets run here</h2>
+  {% if programs %}
+    <div class="scrollx">{{ chart_programs|safe }}</div>
+  {% else %}
+    <p class="nodata">No commands recorded yet.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>
+    Sessions
+    {% if file %}<span class="sub">that touched {{ file }}</span>{% endif %}
+  </h2>
+  {% if file %}
+    <p class="sub"><a href="/workspace/{{ label|urlencode }}">clear file filter</a></p>
+  {% endif %}
+  <div class="scrollx">
+    <table class="grid">
+      <tr><th>When</th><th>Title</th><th>Source</th><th>Host</th><th class="num">Turns</th></tr>
+      {% for s in sessions %}
+        <tr>
+          <td>{{ fmt(s.started_at) }}</td>
+          <td><a href="/session/{{ s.id }}">{{ s.title or "(untitled)" }}</a></td>
+          <td><span class="chip src-{{ s.source }}">{{ s.source }}</span></td>
+          <td>{{ s.host or "" }}</td>
+          <td class="num">{{ s.turn_count }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% if total > page %}
+    <p class="pager">
+      {% if offset > 0 %}
+        <a href="/workspace/{{ label|urlencode }}?offset={{ offset - page }}{% if file %}&file={{ file|urlencode }}{% endif %}{% if key %}&key={{ key|urlencode }}{% endif %}">← newer</a>
+      {% endif %}
+      <span>{{ offset + 1 }}–{{ [offset + page, total]|min }} of {{ total }}</span>
+      {% if offset + page < total %}
+        <a href="/workspace/{{ label|urlencode }}?offset={{ offset + page }}{% if file %}&file={{ file|urlencode }}{% endif %}{% if key %}&key={{ key|urlencode }}{% endif %}">older →</a>
+      {% endif %}
+    </p>
+  {% endif %}
+</section>
+</div>
+{% endblock %}

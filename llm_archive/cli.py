@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -407,9 +408,11 @@ def index_cmd(
         typer.echo("building keyword index, then embedding "
                    "(first run takes a while on CPU)...")
     res = search_index.build(con, vectors_dir, with_vectors=not no_vectors,
-                             progress=None if no_vectors else progress)
+                             progress=None if no_vectors else progress,
+                             blob_dir=(data_dir or db_path.parent) / "blobs")
 
     typer.echo(f"\n  FTS rows   {res.fts_rows}")
+    typer.echo(f"  facts      {res.files} file touches, {res.commands} commands")
     typer.echo(f"  chunks     {res.chunks}  ({res.chars/1e6:.2f} MB)")
     if res.skipped_vectors:
         typer.echo("  vectors    skipped — keyword search only")
@@ -857,6 +860,166 @@ def topics(
         label = r["label"] if len(r["label"]) <= width else r["label"][:width - 1] + "…"
         typer.echo(f"  {r['n']:>4}  {label:<{width}}  {r['slug']}")
     typer.echo("\nfilter with: llma search <query> --topic <slug>")
+
+
+def _facts_ready(con) -> bool:
+    """False when the archive has been ingested but never indexed.
+
+    Worth distinguishing from "nothing matched": one means the file was never touched,
+    the other means the question has not been asked yet.
+    """
+    try:
+        if con.execute("SELECT 1 FROM touched_file LIMIT 1").fetchone():
+            return True
+        if con.execute("SELECT 1 FROM command LIMIT 1").fetchone():
+            return True
+    except sqlite3.OperationalError:
+        return False
+    return not con.execute(
+        "SELECT 1 FROM part WHERE kind='tool_use' LIMIT 1").fetchone()
+
+
+@app.command("who-touched")
+def who_touched_cmd(
+    path: str = typer.Argument(..., help="a file name or path fragment, e.g. src/db.py"),
+    limit: int = typer.Option(20, "--limit", "-n"),
+    writes: bool = typer.Option(False, "--writes",
+                                help="only calls that changed the file"),
+    action: list[str] = typer.Option(None, "--action", "-a",
+                                     help="read|write|edit|delete|search|list; repeatable"),
+    exact: bool = typer.Option(False, "--exact",
+                               help="match the whole path, not a suffix"),
+    source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
+    workspace: str = typer.Option(None, "--workspace", "-w"),
+    host: str = typer.Option(None, "--host"),
+    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
+    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    abandoned: bool = typer.Option(False, "--abandoned",
+                                   help="include abandoned branches"),
+    json_out: bool = typer.Option(False, "--json"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Which sessions read, wrote or edited a file.
+
+        llma who-touched db.py                    # by name, anywhere
+        llma who-touched llm_archive/core/db.py   # by path fragment
+        llma who-touched src/train.py --writes    # only the ones that changed it
+
+    Derived from the tool calls themselves, so it covers every agent at once and does
+    not care which machine the file was on.
+    """
+    from . import api
+    from .search.hybrid import Filters
+
+    con, _, _ = _open(data_dir)
+    filters = Filters(sources=tuple(source or ()), workspace=workspace, host=host,
+                      since=api.parse_day(since), until=api.parse_day(until),
+                      include_abandoned=abandoned)
+    payload = api.who_touched_payload(
+        con, path, limit=limit, actions=tuple(action or ()), writes_only=writes,
+        exact=exact, filters=filters)
+
+    if json_out:
+        _echo_json(payload)
+        return
+
+    if not payload["results"]:
+        if not _facts_ready(con):
+            typer.echo("no file history yet - run `llma index`")
+        else:
+            typer.echo(f"nothing in the archive touched {path!r}")
+        raise typer.Exit(1)
+
+    hits = payload["results"]
+    typer.echo(f"{payload['count']} session(s) touched  {path}   "
+               f"({payload['calls']} calls, matched by {payload['matched']})")
+    for i, hit in enumerate(hits, start=1):
+        title = hit.get("title") or "(untitled)"
+        typer.echo(f"\n{i:>2}. {title}")
+        where = " · ".join(x for x in (hit["last_at"][:10] if hit.get("last_at") else None,
+                                       hit.get("source"), hit.get("workspace"),
+                                       hit.get("host")) if x)
+        calls = f"{hit['calls']} call" + ("s" if hit["calls"] != 1 else "")
+        if hit["writes"]:
+            calls += f", {hit['writes']} write" + ("s" if hit["writes"] != 1 else "")
+        typer.echo(f"    {where}   {calls} ({','.join(hit['actions'])})"
+                   f"   [#{hit['session_id']}]")
+        typer.echo(f"    {hit['path']}")
+    typer.echo(f"\nread one with: llma show {hits[0]['session_id']} --tools")
+
+
+@app.command("commands")
+def commands_cmd(
+    substring: str = typer.Argument(None, help="match anywhere in the command line; "
+                                              "omit to rank the programs you run most"),
+    limit: int = typer.Option(20, "--limit", "-n"),
+    program: str = typer.Option(None, "--program", "-p",
+                                help="exact program name, e.g. git, pytest, docker"),
+    source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
+    workspace: str = typer.Option(None, "--workspace", "-w"),
+    host: str = typer.Option(None, "--host"),
+    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
+    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    abandoned: bool = typer.Option(False, "--abandoned",
+                                   help="include abandoned branches"),
+    json_out: bool = typer.Option(False, "--json"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Shell commands an agent ran, across every session.
+
+        llma commands                     # what you actually run, ranked
+        llma commands "alembic upgrade"   # every time you ran it, and where
+        llma commands -p git --workspace football
+
+    The whole command line is kept, not the 300-character summary the transcript shows.
+    """
+    from . import api
+    from .search.hybrid import Filters
+
+    con, _, _ = _open(data_dir)
+    filters = Filters(sources=tuple(source or ()), workspace=workspace, host=host,
+                      since=api.parse_day(since), until=api.parse_day(until),
+                      include_abandoned=abandoned)
+    payload = api.commands_payload(con, substring, limit=limit, program=program,
+                                   filters=filters)
+
+    if json_out:
+        _echo_json(payload)
+        return
+
+    if payload["mode"] == "programs":
+        rows = payload["programs"]
+        if not rows:
+            typer.echo("no commands yet - run `llma index`"
+                       if not _facts_ready(con) else "no commands in the archive")
+            raise typer.Exit(1)
+        width = min(max(len(r["program"]) for r in rows), 20)
+        for row in rows:
+            subs = " · ".join(f"{x['subcommand']} {x['runs']}"
+                              for x in row["top_subcommands"])
+            typer.echo(f"  {row['runs']:>5}  {row['program']:<{width}}  "
+                       f"{row['sessions']:>3} sessions   {subs}")
+        typer.echo("\nfilter with: llma commands <substring>   or   "
+                   "llma commands -p <program>")
+        return
+
+    rows = payload["results"]
+    if not rows:
+        typer.echo(f"no command matched {substring or program!r}")
+        raise typer.Exit(1)
+    for row in rows:
+        flags = []
+        if row["ok"] is False:
+            flags.append("FAILED")
+        if row["duration_ms"]:
+            flags.append(f"{row['duration_ms']/1000:.1f}s")
+        where = " · ".join(x for x in (row["at"][:10] if row["at"] else None,
+                                       row["source"], row["workspace"]) if x)
+        typer.echo(f"\n  {where}  {' '.join(flags)}  [#{row['session_id']}]")
+        for line in row["text"].splitlines()[:6]:
+            typer.echo(f"    {line}")
+        if row["truncated"] or len(row["text"].splitlines()) > 6:
+            typer.echo("    …")
 
 
 @app.command()

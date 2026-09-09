@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from ..core import db
-from . import fts, selection
+from . import facts, fts, selection
 from .chunker import chunk_part, context_header
 from .embed import DEFAULT_MODEL, MODEL_TAG, Embedder, VectorStore
 
@@ -25,6 +25,8 @@ class IndexResult:
     skipped_vectors: bool = False
     model_tag: str = MODEL_TAG
     topics: int = 0
+    files: int = 0
+    commands: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -47,25 +49,52 @@ def _embeddable_parts(con: sqlite3.Connection):
 
 def build(con: sqlite3.Connection, vectors_dir: Path,
           model_name: str = DEFAULT_MODEL, model_tag: str = MODEL_TAG,
-          with_vectors: bool = True, progress=None) -> IndexResult:
+          with_vectors: bool = True, progress=None,
+          blob_dir: Path | None = None) -> IndexResult:
     """Build the indexes and record that it happened.
 
     The record is the point: an index carries no timestamp of its own, so without one
     nothing downstream can tell a fresh index from one invalidated by a later ingest.
     """
     started = int(time.time() * 1000)
-    result = _build(con, vectors_dir, model_name, model_tag, with_vectors, progress)
+    result = _build(con, vectors_dir, model_name, model_tag, with_vectors, progress,
+                    blob_dir)
     db.record_index_run(con, started, result)
     return result
 
 
 def _build(con: sqlite3.Connection, vectors_dir: Path,
            model_name: str = DEFAULT_MODEL, model_tag: str = MODEL_TAG,
-           with_vectors: bool = True, progress=None) -> IndexResult:
+           with_vectors: bool = True, progress=None,
+           blob_dir: Path | None = None) -> IndexResult:
     result = IndexResult(model_tag=model_tag)
     t0 = time.perf_counter()
 
     result.fts_rows = fts.rebuild(con)
+
+    # Derived here, beside FTS, and deliberately ABOVE the --no-vectors return below:
+    # both are wholesale rebuilds from `part`, neither needs a vector, and a
+    # keyword-only run must not leave the archive with a fresh keyword index and a
+    # month-old answer to "who touched this file". Wrapped for the same reason the
+    # topic build is: search has to survive a derivation failure.
+    try:
+        derived = facts.rebuild(con, blob_dir)
+        result.files, result.commands = derived.files, derived.commands
+        if derived.missing:
+            result.warnings.append(
+                f"{derived.missing} tool call(s) have no stored payload — run "
+                f"`llma ingest --force` to derive their files and commands")
+        if derived.unreadable:
+            result.warnings.append(
+                f"{derived.unreadable} tool payload(s) are in a blob that is missing")
+        if derived.unknown_tools:
+            top = sorted(derived.unknown_tools.items(), key=lambda kv: -kv[1])[:3]
+            result.warnings.append(
+                "unrecognised tools produced no files or commands: "
+                + ", ".join(f"{name} x{n}" for name, n in top))
+    except Exception as exc:  # noqa: BLE001 - search must survive a derivation failure
+        result.warnings.append(f"fact derivation failed ({type(exc).__name__}: "
+                               f"{str(exc)[:120]}); search is unaffected")
 
     rows = _embeddable_parts(con)
     chunks = []

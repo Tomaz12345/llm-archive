@@ -267,6 +267,7 @@ def run(data_dir: Path | None = None, with_vectors: bool = True,
             # from a hang. Hence the heartbeat.
             log(f"  indexing ({changed} session(s) changed; full re-embed)...")
             result.index = search_index.build(con, db_path.parent / "vectors",
+                                              blob_dir=db_path.parent / "blobs",
                                               with_vectors=with_vectors,
                                               progress=_heartbeat(log))
             log(f"  index: {result.index.fts_rows} keyword rows, "

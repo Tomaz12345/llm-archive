@@ -35,6 +35,7 @@ from ..core.models import (
     KIND_THINKING,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -232,11 +233,11 @@ class ClaudeWebAdapter:
         if btype == "tool_use":
             name = str(blk.get("name") or "tool")
             payload = blk.get("input")
-            return Part(
+            return attach_tool_input(Part(
                 kind=KIND_TOOL_USE, seq=seq, tool_name=name,
                 text=self._summarise(payload),
                 bytes=len(json.dumps(payload or {}, ensure_ascii=False)),
-                embed_eligible=True)
+                embed_eligible=True), payload, self.blobs)
 
         if btype == "tool_result":
             content = blk.get("content")

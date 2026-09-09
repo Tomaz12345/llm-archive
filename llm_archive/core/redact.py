@@ -272,15 +272,24 @@ def apply(con: sqlite3.Connection, wide: bool = False, dry_run: bool = False,
     result = RedactResult(dry_run=dry_run)
     now = int(time.time() * 1000)
 
-    where = "p.text IS NOT NULL" + (" AND p.redacted = 0" if only_new else "")
+    # `tool_input` is scanned alongside `text` because it is the single most leak-prone
+    # column in the archive: a Bash payload is exactly where `export AWS_SECRET=...` and
+    # `curl -H "Authorization: Bearer ..."` live, and the summary in `text` is truncated
+    # well before most of them. Both feed the same `redacted` counter and the same
+    # `redaction` rows -- one leak is one leak, whichever column carried it.
+    where = ("(p.text IS NOT NULL OR p.tool_input IS NOT NULL)"
+             + (" AND p.redacted = 0" if only_new else ""))
     rows = con.execute(f"""
-        SELECT p.id, p.text, m.session_id
+        SELECT p.id, p.text, p.tool_input, m.session_id
         FROM part p JOIN message m ON m.id = p.message_id
         WHERE {where}""").fetchall()
 
     for row in rows:
         result.parts_scanned += 1
-        new_text, applied = redact_text(row["text"], rules)
+        new_text, applied = redact_text(row["text"], rules) if row["text"] else (None, [])
+        new_input, applied_input = (redact_text(row["tool_input"], rules)
+                                    if row["tool_input"] else (None, []))
+        applied = applied + applied_input
         if not applied:
             continue
         result.parts_changed += 1
@@ -290,8 +299,10 @@ def apply(con: sqlite3.Connection, wide: bool = False, dry_run: bool = False,
         if dry_run:
             continue
 
-        con.execute("UPDATE part SET text=?, redacted=redacted+? WHERE id=?",
-                    (new_text, len(applied), row["id"]))
+        con.execute(
+            "UPDATE part SET text=?, tool_input=?, redacted=redacted+? WHERE id=?",
+            (new_text if row["text"] else None,
+             new_input if row["tool_input"] else None, len(applied), row["id"]))
         # One row per distinct secret in this part, not per occurrence: the useful
         # question is "which keys leaked and where", and a key repeated 40 times in one
         # .env dump is one leak.

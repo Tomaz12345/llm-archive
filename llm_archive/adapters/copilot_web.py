@@ -93,6 +93,7 @@ from ..core.models import (
     KIND_TEXT,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -378,14 +379,14 @@ class CopilotWebAdapter:
                 stats.unknown(f"{self.kind}:toolCall-without-skillExecution")
                 return
             status = skill.get("status")
-            message.parts.append(Part(
+            message.parts.append(attach_tool_input(Part(
                 kind=KIND_TOOL_USE, seq=seq,
                 tool_name=_text(skill.get("slug")) or "skill",
                 text=_text(skill.get("arguments"))[:300],
                 tool_ok=(status == "completed") if status else None,
                 # `arguments` is the whole call; the excerpt above is only what is shown.
                 bytes=len(_text(skill.get("arguments")).encode("utf-8")),
-                embed_eligible=True))
+                embed_eligible=True), skill.get("arguments"), self.blobs))
 
             # The references ARE the result — the files read and the API responses
             # returned. Stored and keyword-searchable, never embedded: this is the

@@ -56,6 +56,7 @@ from ..core.models import (
     KIND_TEXT,
     KIND_THINKING,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -504,12 +505,12 @@ class OpenRouterAdapter:
             # Server tools are enabled in every sample export but never fired, so the
             # argument shape is unconfirmed; keep the call's intent, per §1.1.
             args = data.get("arguments")
-            return Part(
+            return attach_tool_input(Part(
                 kind=KIND_TOOL_USE, seq=seq,
                 tool_name=str(data.get("name") or dtype),
                 text=args if isinstance(args, str)
                 else json.dumps(args, ensure_ascii=False) if args else text,
-                embed_eligible=True)
+                embed_eligible=True), args, self.blobs)
 
         stats.unknown(f"{self.kind}:item:{dtype}")
         return None

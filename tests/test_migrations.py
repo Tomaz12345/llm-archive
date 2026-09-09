@@ -297,5 +297,102 @@ def test_fresh_and_migrated_databases_agree(tmp_path):
     def shape(con, table):
         return {(r[1], r[2]) for r in con.execute(f"PRAGMA table_info({table})")}
 
-    for table in ("session", "message", "topic", "session_topic"):
+    for table in ("session", "message", "part", "topic", "session_topic",
+                  "touched_file", "command"):
         assert shape(con_migrated, table) == shape(con_fresh, table), table
+
+
+def make_v10(path: Path) -> None:
+    """A database as it looked before the derived tool tables.
+
+    Built by stripping the v11 additions back out of SCHEMA. This is load-bearing:
+    make_v9 and make_v7 build from the CURRENT SCHEMA, so without an explicit v10
+    fixture the two ALTERs in MIGRATIONS[11] would be swallowed as duplicate columns
+    and the migration would never actually be exercised.
+    """
+    schema = db.SCHEMA
+    # Strip from the v11 comment block to the end of the part table, so
+    # `duration_ms` is the last column again -- trailing comma and all.
+    marker = "  -- tool_use only: the call's arguments"
+    assert marker in schema, "SCHEMA changed; this fixture no longer strips v11"
+    start = schema.index(marker)
+    end = schema.index("REFERENCES blob(id)", start) + len("REFERENCES blob(id)")
+    schema = schema[:start] + schema[end:].lstrip("\n")
+    schema = schema.replace("  duration_ms    INTEGER,", "  duration_ms    INTEGER")
+    # Removed by identity rather than by scanning for the next ";" -- these DDLs
+    # carry semicolons inside their column comments.
+    for ddl in (db.TOUCHED_FILE_DDL, db.COMMAND_DDL):
+        assert ddl.strip() + ";" in schema
+        schema = schema.replace(ddl.strip() + ";", "")
+
+    con = sqlite3.connect(path)
+    con.executescript(schema)
+    con.execute("INSERT INTO meta(key,value) VALUES ('schema_version','10')")
+    con.execute("INSERT INTO source(id,kind,label,surface) "
+                "VALUES (1,'claude_code','Claude Code','cli')")
+    con.execute("""INSERT INTO session(id,source_id,native_id,started_at,msg_count,
+                                       raw_path,raw_hash,ingested_at)
+                   VALUES (1,1,'s1',1,1,'x','h',1)""")
+    con.execute("""INSERT INTO message(id,session_id,native_id,seq,on_active_path,
+                                       role,created_at)
+                   VALUES (1,1,'u1',0,1,'assistant',1)""")
+    con.execute("""INSERT INTO part(id,message_id,seq,kind,text,tool_name)
+                   VALUES (1,1,0,'tool_use','file_path: /a/b.py','Read')""")
+    con.commit()
+    con.close()
+
+
+def test_v11_adds_the_payload_column_and_the_derived_tables(tmp_path):
+    path = tmp_path / "a.db"
+    make_v10(path)
+    con = db.connect(path)
+
+    cols = {r[1] for r in con.execute("PRAGMA table_info(part)")}
+    assert {"tool_input", "tool_input_blob_id"} <= cols
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"touched_file", "command"} <= tables
+    assert con.execute("SELECT value FROM meta WHERE key='schema_version'"
+                       ).fetchone()[0] == "11"
+    # the part that was already there survives, with the new column empty
+    assert con.execute("SELECT tool_input FROM part WHERE id=1").fetchone()[0] is None
+    assert not list(con.execute("PRAGMA foreign_key_check"))
+
+
+def test_v11_is_safe_to_re_run(tmp_path):
+    """connect() runs SCHEMA before the ladder, so both must tolerate the other having
+    already done the work."""
+    path = tmp_path / "a.db"
+    make_v10(path)
+    db.connect(path).close()
+    con = db.connect(path)
+    assert con.execute("SELECT COUNT(*) FROM touched_file").fetchone()[0] == 0
+    assert not list(con.execute("PRAGMA foreign_key_check"))
+
+
+def test_v11_ddl_is_shared_between_fresh_and_migrated(tmp_path):
+    """The same trap as v10: a table written only into MIGRATIONS never reaches a fresh
+    archive, and one written only into SCHEMA never reaches an existing one."""
+    assert db.TOUCHED_FILE_DDL in db.MIGRATIONS[11]
+    assert db.COMMAND_DDL in db.MIGRATIONS[11]
+    assert db.TOUCHED_FILE_DDL.strip() in db.SCHEMA
+    assert db.COMMAND_DDL.strip() in db.SCHEMA
+
+
+def test_the_derived_rows_go_when_their_part_does(tmp_path):
+    """Ingest deletes and re-inserts a re-parsed message's parts, renumbering part.id.
+    Without the cascade the archive would keep answering `who-touched` from calls that
+    no longer exist."""
+    path = tmp_path / "a.db"
+    make_v10(path)
+    con = db.connect(path)
+    con.execute("""INSERT INTO touched_file(part_id,session_id,at,action,path,norm,base)
+                   VALUES (1,1,1,'read','/a/b.py','/a/b.py','b.py')""")
+    con.execute("""INSERT INTO command(part_id,session_id,at,argv0,text)
+                   VALUES (1,1,1,'pytest','pytest -q')""")
+    con.commit()
+
+    con.execute("DELETE FROM part WHERE id=1")
+    con.commit()
+    assert con.execute("SELECT COUNT(*) FROM touched_file").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM command").fetchone()[0] == 0

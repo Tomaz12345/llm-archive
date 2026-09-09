@@ -171,6 +171,80 @@ TOOLS = [
         "annotations": _READ_ONLY,
     },
     {
+        "name": "who_touched",
+        "title": "Sessions that touched a file",
+        "description":
+            "Find the past sessions that read, wrote or edited a given file, newest "
+            "first. This is the fastest honest answer to \"why is this code like "
+            "this\" — it goes from a path to the conversations that produced it, "
+            "which git blame cannot do. Derived from the tool calls themselves, so it "
+            "spans every agent at once and does not care which machine the file was "
+            "on: a file edited over SSH and the same file on Windows are matched "
+            "together. Pass a bare filename (db.py) to match anywhere, a path fragment "
+            "(core/db.py) to match that path under any root, or an absolute path. Set "
+            "writes_only when you want the sessions that CHANGED the file rather than "
+            "the many that only read it. Follow up with `show` and include_tools to "
+            "read what was actually done.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "A filename, a path fragment, or an absolute path.",
+                },
+                "writes_only": {
+                    "type": "boolean", "default": False,
+                    "description": "Only calls that changed the file "
+                                   "(write, edit, delete).",
+                },
+                "exact": {
+                    "type": "boolean", "default": False,
+                    "description": "Match the whole normalised path, not a suffix.",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "default": 20},
+                **_FILTERS,
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "commands",
+        "title": "Shell commands run in past sessions",
+        "description":
+            "Search the shell commands agents actually ran, with the session around "
+            "each one. Call it with a substring to find every time something was run "
+            "and where — the flag that made a build work, the exact migration "
+            "invocation, the curl that reproduced a bug. Call it with NO substring to "
+            "get a ranking of the programs used most, which is the quickest way to "
+            "learn how a project is actually driven. The whole command line is stored, "
+            "not the short summary a transcript shows, so long heredocs and pipelines "
+            "are searchable in full. This is a better shell history than the shell "
+            "keeps, because each command still carries the conversation that ran it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "substring": {
+                    "type": "string",
+                    "description": "Match anywhere in the command line. Omit to rank "
+                                   "the programs run most.",
+                },
+                "program": {
+                    "type": "string",
+                    "description": "Exact program name, e.g. git, pytest, docker, uv.",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "default": 20},
+                **_FILTERS,
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
         "name": "related",
         "title": "Sessions like this one",
         "description":
@@ -290,7 +364,36 @@ def _tool_related(archive: Archive, args: dict) -> dict:
     return payload
 
 
-HANDLERS = {"search": _tool_search, "show": _tool_show, "related": _tool_related}
+def _tool_who_touched(archive: Archive, args: dict) -> dict:
+    con, _ = archive.open()
+    path = args.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path must be a non-empty string")
+    return api.who_touched_payload(
+        con, path,
+        limit=_bounded(args.get("limit"), 20, 1, 100),
+        writes_only=bool(args.get("writes_only")),
+        exact=bool(args.get("exact")),
+        filters=_filters(args))
+
+
+def _tool_commands(archive: Archive, args: dict) -> dict:
+    con, _ = archive.open()
+    substring = args.get("substring")
+    if substring is not None and not isinstance(substring, str):
+        raise ValueError("substring must be a string")
+    program = args.get("program")
+    if program is not None and not isinstance(program, str):
+        raise ValueError("program must be a string")
+    return api.commands_payload(
+        con, substring or None,
+        limit=_bounded(args.get("limit"), 20, 1, 100),
+        program=program or None,
+        filters=_filters(args))
+
+
+HANDLERS = {"search": _tool_search, "show": _tool_show, "related": _tool_related,
+            "who_touched": _tool_who_touched, "commands": _tool_commands}
 
 
 # --------------------------------------------------------------- protocol ----

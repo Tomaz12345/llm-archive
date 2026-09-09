@@ -79,6 +79,7 @@ from ..core.models import (
     KIND_THINKING,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -396,9 +397,10 @@ class T3ChatAdapter:
         else:
             call = json.dumps(args, ensure_ascii=False) if args else ""
 
-        parts = [Part(kind=KIND_TOOL_USE, seq=0, tool_name=name, text=call or None,
-                      bytes=len(json.dumps(args, ensure_ascii=False)),
-                      embed_eligible=bool(call))]
+        parts = [attach_tool_input(
+            Part(kind=KIND_TOOL_USE, seq=0, tool_name=name, text=call or None,
+                 bytes=len(json.dumps(args, ensure_ascii=False)),
+                 embed_eligible=bool(call)), args, self.blobs)]
 
         if name == "image_generation":
             # The bytes live behind a CDN URL that the export does not include, so the

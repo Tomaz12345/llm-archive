@@ -246,3 +246,209 @@ def session_payload(con: sqlite3.Connection, session_id: int, *,
         "omitted_parts": omitted,
         "truncated": omitted > 0,
     }
+
+
+# --- derived tool facts ------------------------------------------------------
+#
+# Both reads join back up to `message`/`session`/`source`/`workspace` so `Filters.sql()`
+# applies unchanged -- its clauses are written against those aliases. That is worth the
+# joins: `--source`, `--workspace`, `--since` and `--abandoned` all work here for free,
+# and the last one matters more than it looks. An edit made on a branch that was later
+# rewound is still in `part`, and excluding it is exactly what "which sessions actually
+# changed this file" means.
+
+_FACT_FROM = """
+  FROM touched_file tf
+  JOIN part p    ON p.id = tf.part_id
+  JOIN message m ON m.id = p.message_id
+  JOIN session s ON s.id = m.session_id
+  JOIN source src ON src.id = s.source_id
+  LEFT JOIN workspace w ON w.id = s.workspace_id
+"""
+
+_CMD_FROM = """
+  FROM command c
+  JOIN part p    ON p.id = c.part_id
+  JOIN message m ON m.id = p.message_id
+  JOIN session s ON s.id = m.session_id
+  JOIN source src ON src.id = s.source_id
+  LEFT JOIN workspace w ON w.id = s.workspace_id
+"""
+
+WRITE_ACTIONS = ("write", "edit", "delete")
+
+
+def _where(filters, extra: list[str], params: list) -> tuple[str, list]:
+    clause, fparams = (filters.sql() if filters is not None else ("", ()))
+    parts = [x for x in ([clause] if clause else []) + extra if x]
+    return (" WHERE " + " AND ".join(parts) if parts else ""), params + list(fparams)
+
+
+def file_match(query: str, exact: bool = False) -> tuple[str, list, str]:
+    """How a path query is matched, and the name of the strategy that fired.
+
+    Three strategies, most specific first, because the three ways people name a file
+    are genuinely different questions. `db.py` means "anywhere"; `core/db.py` means
+    "this path, under any root, on any machine"; an absolute path means that file.
+    The strategy is reported back so a surprising result set explains itself.
+    """
+    from .core import toolinput
+
+    raw = (query or "").strip()
+    if not raw:
+        return "", [], "none"
+
+    normal = toolinput.normalise_path(raw)
+    norm = normal.norm if normal else raw.replace(chr(92), "/").casefold()
+
+    if exact:
+        return "tf.norm = ?", [norm], "exact"
+    if "/" not in raw and chr(92) not in raw:
+        return "tf.base = ?", [raw.casefold()], "name"
+    # A path fragment matches any root: the same file reached from a Windows checkout
+    # and over SSH is the same file.
+    return "(tf.rel = ? OR tf.norm = ? OR tf.norm LIKE ?)", [norm, norm, f"%/{norm}"], "path"
+
+
+def who_touched_payload(con: sqlite3.Connection, query: str, *, limit: int = 20,
+                        actions: tuple[str, ...] = (), writes_only: bool = False,
+                        exact: bool = False, filters=None) -> dict:
+    """Which sessions read, wrote or edited a file."""
+    match, params, strategy = file_match(query, exact)
+    if not match:
+        return {"query": query, "matched": "none", "count": 0,
+                "calls": 0, "results": []}
+
+    extra = [match]
+    if writes_only:
+        extra.append(f"tf.action IN ({','.join('?' * len(WRITE_ACTIONS))})")
+        params = params + list(WRITE_ACTIONS)
+    elif actions:
+        extra.append(f"tf.action IN ({','.join('?' * len(actions))})")
+        params = params + list(actions)
+
+    where, params = _where(filters, extra, params)
+    rows = con.execute(f"""
+        SELECT tf.session_id, COUNT(*) AS calls,
+               SUM(CASE WHEN tf.action IN ('write','edit','delete') THEN 1 ELSE 0 END)
+                   AS writes,
+               MIN(tf.at) AS first_at, MAX(tf.at) AS last_at,
+               GROUP_CONCAT(DISTINCT tf.action) AS actions,
+               MIN(tf.path) AS path, MIN(tf.norm) AS norm
+        {_FACT_FROM} {where}
+        GROUP BY tf.session_id
+        ORDER BY last_at DESC
+        LIMIT ?""", (*params, limit)).fetchall()
+
+    results = []
+    for row in rows:
+        brief_row = session_row(con, row["session_id"])
+        results.append({
+            **(session_brief(brief_row) if brief_row is not None
+               else {"session_id": row["session_id"]}),
+            "path": row["path"],
+            "norm": row["norm"],
+            "calls": row["calls"],
+            "writes": row["writes"],
+            "actions": sorted((row["actions"] or "").split(",")),
+            "first_at": iso(row["first_at"]),
+            "last_at": iso(row["last_at"]),
+        })
+    return {"query": query, "matched": strategy, "count": len(results),
+            "calls": sum(r["calls"] for r in results), "results": results}
+
+
+def commands_payload(con: sqlite3.Connection, substring: str | None = None, *,
+                     limit: int = 20, program: str | None = None,
+                     filters=None, text_chars: int = PART_CHARS) -> dict:
+    """Shell commands an agent ran, or -- with no substring -- what gets run most.
+
+    The two modes answer different questions. "What did I run" wants the occurrences;
+    "what do I run" wants the ranking, and is the discoverable entry point.
+    """
+    extra, params = [], []
+    if substring:
+        extra.append("c.text LIKE ?")
+        params.append(f"%{substring}%")
+    if program:
+        extra.append("c.argv0 = ?")
+        params.append(program.casefold())
+    where, params = _where(filters, extra, params)
+
+    if not substring and not program:
+        rows = con.execute(f"""
+            SELECT c.argv0, COUNT(*) AS runs,
+                   COUNT(DISTINCT c.session_id) AS sessions, MAX(c.at) AS last_at
+            {_CMD_FROM} {where}
+            GROUP BY c.argv0 ORDER BY runs DESC LIMIT ?""",
+            (*params, limit)).fetchall()
+        programs = []
+        for row in rows:
+            subs = con.execute(f"""
+                SELECT c.subcommand, COUNT(*) AS runs
+                {_CMD_FROM} {where} {'AND' if where else 'WHERE'}
+                      c.argv0 = ? AND c.subcommand IS NOT NULL
+                GROUP BY c.subcommand ORDER BY runs DESC LIMIT 3""",
+                (*params, row["argv0"])).fetchall()
+            programs.append({
+                "program": row["argv0"], "runs": row["runs"],
+                "sessions": row["sessions"], "last_at": iso(row["last_at"]),
+                "top_subcommands": [{"subcommand": x["subcommand"], "runs": x["runs"]}
+                                    for x in subs],
+            })
+        return {"query": None, "mode": "programs", "count": len(programs),
+                "programs": programs}
+
+    rows = con.execute(f"""
+        SELECT c.id, c.session_id, c.at, c.argv0, c.subcommand, c.text, c.shell,
+               c.cwd, c.ok, c.duration_ms,
+               s.title, src.kind AS source, COALESCE(w.label,'') AS workspace
+        {_CMD_FROM} {where}
+        ORDER BY c.at DESC LIMIT ?""", (*params, limit)).fetchall()
+    return {
+        "query": substring, "mode": "runs", "count": len(rows),
+        "results": [{
+            "session_id": row["session_id"],
+            "title": row["title"],
+            "source": row["source"],
+            "workspace": row["workspace"] or None,
+            "at": iso(row["at"]),
+            "program": row["argv0"],
+            "subcommand": row["subcommand"],
+            "shell": row["shell"],
+            "cwd": row["cwd"],
+            "ok": None if row["ok"] is None else bool(row["ok"]),
+            "duration_ms": row["duration_ms"],
+            **_text(row["text"], text_chars),
+        } for row in rows],
+    }
+
+
+def session_files(con: sqlite3.Connection, session_id: int,
+                  limit: int = 40) -> list[dict]:
+    """What one session opened, wrote and ran. Grouped by `rel` so the same file
+    reached from two roots is one row."""
+    rows = con.execute("""
+        SELECT COALESCE(tf.rel, tf.norm) AS key, MIN(tf.path) AS path,
+               COUNT(*) AS calls,
+               SUM(CASE WHEN tf.action IN ('write','edit','delete') THEN 1 ELSE 0 END)
+                   AS writes,
+               GROUP_CONCAT(DISTINCT tf.action) AS actions,
+               MAX(tf.at) AS last_at
+        FROM touched_file tf WHERE tf.session_id = ?
+        GROUP BY key ORDER BY writes DESC, calls DESC LIMIT ?""",
+        (session_id, limit)).fetchall()
+    return [{"key": r["key"], "path": r["path"], "calls": r["calls"],
+             "writes": r["writes"], "actions": sorted((r["actions"] or "").split(",")),
+             "last_at": iso(r["last_at"])} for r in rows]
+
+
+def session_commands(con: sqlite3.Connection, session_id: int,
+                     limit: int = 10) -> list[dict]:
+    """The programs one session ran. A 6,000-command session is not a list."""
+    rows = con.execute("""
+        SELECT argv0, COUNT(*) AS runs, MAX(at) AS last_at
+        FROM command WHERE session_id = ?
+        GROUP BY argv0 ORDER BY runs DESC LIMIT ?""", (session_id, limit)).fetchall()
+    return [{"program": r["argv0"], "runs": r["runs"], "last_at": iso(r["last_at"])}
+            for r in rows]

@@ -57,7 +57,7 @@
         <div class="hit-meta">
           <span class="chip src-{{ h.source }}">{{ h.source }}</span>
           <span>{{ item.when }}</span>
-          {% if h.workspace %}<span>· {{ h.workspace }}</span>{% endif %}
+          {% if h.workspace %}<span>· <a href="/workspace/{{ h.workspace|urlencode }}" title="everything this project touched">{{ h.workspace }}</a></span>{% endif %}
           {% if h.host %}<span>· {{ h.host }}</span>{% endif %}
           <span class="match match-{{ h.matched_by }}" title="which retriever found it">
             {{ h.matched_by }}

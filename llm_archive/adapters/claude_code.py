@@ -56,6 +56,7 @@ from ..core.models import (
     KIND_TEXT,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -447,6 +448,7 @@ class ClaudeCodeAdapter:
             part = Part(kind=KIND_TOOL_USE, seq=seq, text=summary, tool_name=name,
                         bytes=len(json.dumps(blk.get("input") or {})),
                         embed_eligible=True)  # intent is worth embedding; the payload is not
+            attach_tool_input(part, blk.get("input"), self.blobs)
             tool_id = blk.get("id")
             if isinstance(tool_id, str) and when:
                 tool_calls[tool_id] = (when, part)
@@ -552,6 +554,10 @@ class ClaudeCodeAdapter:
         for key in ("command", "file_path", "path", "pattern", "query", "url",
                     "description", "prompt", "notebook_path"):
             if isinstance(value.get(key), str) and value[key].strip():
-                return f"{key}: {value[key][:300]}"
+                # A command line is the one payload worth carrying whole into `text`:
+                # `part_fts` is external-content over THIS column and nothing else, so
+                # a 300-character cap left 47% of Bash calls unfindable by search.
+                cap = 2000 if key == "command" else 300
+                return f"{key}: {value[key][:cap]}"
         keys = ", ".join(sorted(value)[:6])
         return f"({keys})" if keys else ""

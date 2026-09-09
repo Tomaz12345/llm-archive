@@ -37,6 +37,7 @@ from ..core.models import (
     KIND_TEXT,
     KIND_TOOL_RESULT,
     KIND_TOOL_USE,
+    attach_tool_input,
     Message,
     ParseStats,
     Part,
@@ -186,10 +187,10 @@ class CodexAdapter:
                 summary = self._call_summary(payload)
                 msg = Message(native_id=call_id, role="assistant", created_at=when,
                               seq=seq)
-                call_part = Part(
+                call_part = attach_tool_input(Part(
                     kind=KIND_TOOL_USE, seq=0, text=summary, tool_name=str(name),
                     bytes=len(json.dumps(payload, ensure_ascii=False)),
-                    embed_eligible=True)
+                    embed_eligible=True), payload, self.blobs)
                 msg.parts.append(call_part)
                 if call_id:
                     pending_calls[call_id] = (str(name), when, call_part)

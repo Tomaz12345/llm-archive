@@ -22,7 +22,7 @@ from llm_archive.cli import app as cli_app
 from llm_archive.core import db
 from llm_archive.core.models import Message, Part, Session
 from llm_archive.mcp import server as mcp
-from llm_archive.search import fts
+from llm_archive.search import facts, fts
 
 LONG_REPLY = ("Both workers take the same two row locks in opposite order. " * 120)
 LONG_TOOL_OUTPUT = ("pid 4412 waiting on transactionid 91823; blocked by pid 4409. " * 90)
@@ -41,9 +41,12 @@ def data_dir(tmp_path) -> Path:
         for i, (role, kind_, text) in enumerate(parts):
             m = Message(native_id=f"{native}-{i}", role=role, seq=i,
                         created_at=1771200000000 + i * 1000)
-            m.parts.append(Part(kind=kind_, seq=0, text=text,
-                                embed_eligible=kind_ == "text",
-                                tool_name="Bash" if kind_ == "tool_use" else None))
+            part = Part(kind=kind_, seq=0, text=text,
+                        embed_eligible=kind_ == "text",
+                        tool_name="Bash" if kind_ == "tool_use" else None)
+            if kind_ == "tool_use":
+                part.tool_input = json.dumps({"command": text})
+            m.parts.append(part)
             msgs.append(m)
         db.upsert_session(con, source if source is not None else src, Session(
             source_kind=kind, native_id=native, title=title,
@@ -70,8 +73,36 @@ def data_dir(tmp_path) -> Path:
         ("assistant", "text", "pripravil sem nekaj predlogov za tvoj intervju"),
     ], workspace="notes", source=web, kind="chatgpt")
 
+    # A file-touching session, so `who_touched` has something to find. The tool name
+    # and the payload key are what the rule table reads; `text` is only the summary.
+    def add_file_calls(native, title, calls, workspace="payments-api"):
+        msgs = []
+        for i, (tool, path) in enumerate(calls):
+            m = Message(native_id=f"{native}-{i}", role="assistant", seq=i,
+                        created_at=1771200000000 + i * 1000)
+            part = Part(kind="tool_use", seq=0, text=f"file_path: {path}",
+                        tool_name=tool)
+            part.tool_input = json.dumps({"file_path": path})
+            m.parts.append(part)
+            msgs.append(m)
+        db.upsert_session(con, src, Session(
+            source_kind="claude_code", native_id=native, title=title,
+            workspace_key=workspace, workspace_label=workspace, host="dell",
+            started_at=1771200000000, raw_path=f"/raw/{native}", raw_hash=native,
+            messages=msgs))
+
+    add_file_calls("f1", "Rewrote the ledger helper", [
+        ("Edit", "/srv/billing/app/ledger.py"),
+        ("Edit", "/srv/billing/app/ledger.py"),
+        ("Read", "/srv/billing/app/schema.py"),
+    ])
+    add_file_calls("f2", "Only read the ledger helper", [
+        ("Read", "/srv/billing/app/ledger.py"),
+    ])
+
     con.commit()
     fts.rebuild(con)
+    facts.rebuild(con)
     con.close()
     return tmp_path
 
@@ -219,10 +250,13 @@ def test_initialize_falls_back_for_a_version_it_has_never_heard_of(archive):
     assert frame["result"]["protocolVersion"] == mcp.LATEST_PROTOCOL
 
 
-def test_tools_list_is_the_three_read_only_reads(archive):
+def test_tools_list_is_read_only_all_the_way_down(archive):
+    """Every tool this server exposes is a read. Nothing here may write to the
+    archive, which is what makes it safe to hand to any agent."""
     frame = mcp.dispatch(archive, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     tools = frame["result"]["tools"]
-    assert [t["name"] for t in tools] == ["search", "show", "related"]
+    assert [t["name"] for t in tools] == ["search", "show", "who_touched",
+                                          "commands", "related"]
     assert all(t["annotations"]["readOnlyHint"] for t in tools)
 
 
@@ -478,3 +512,97 @@ def test_related_on_a_missing_session_exits_nonzero(data_dir):
     result = run_cli(data_dir, "related", "999")
     assert result.exit_code == 1
     assert "no session #999" in result.stdout
+
+
+# --- who_touched / commands --------------------------------------------------
+
+def test_who_touched_finds_the_session_that_edited_the_file(con):
+    """The whole point: a path in, the conversations that produced it out."""
+    payload = api.who_touched_payload(con, "ledger.py")
+    assert payload["matched"] == "name"
+    titles = [r["title"] for r in payload["results"]]
+    assert "Rewrote the ledger helper" in titles
+    assert "Only read the ledger helper" in titles
+
+
+def test_who_touched_writes_only_excludes_the_readers(con):
+    """"Who changed this" and "who looked at this" are different questions, and the
+    second one is far larger."""
+    payload = api.who_touched_payload(con, "ledger.py", writes_only=True)
+    assert [r["title"] for r in payload["results"]] == ["Rewrote the ledger helper"]
+    assert payload["results"][0]["writes"] == 2
+
+
+def test_who_touched_matches_a_bare_name_and_a_path_fragment(con):
+    """`db.py` and `core/db.py` are both things people type, and they mean different
+    things: anywhere, versus that path under any root."""
+    by_name = api.who_touched_payload(con, "ledger.py")
+    by_path = api.who_touched_payload(con, "app/ledger.py")
+    assert by_name["matched"] == "name"
+    assert by_path["matched"] == "path"
+    assert {r["session_id"] for r in by_name["results"]} \
+        == {r["session_id"] for r in by_path["results"]}
+
+
+def test_who_touched_respects_the_workspace_filter(con):
+    from llm_archive.search.hybrid import Filters
+    payload = api.who_touched_payload(con, "ledger.py",
+                                      filters=Filters(workspace="football"))
+    assert payload["count"] == 0
+
+
+def test_commands_with_no_substring_ranks_the_programs(con):
+    payload = api.commands_payload(con)
+    assert payload["mode"] == "programs"
+    assert payload["programs"], "the fixture runs psql"
+    assert payload["programs"][0]["program"] == "psql"
+
+
+def test_commands_finds_a_run_by_substring(con):
+    payload = api.commands_payload(con, "pg_locks")
+    assert payload["mode"] == "runs"
+    assert payload["count"] == 1
+    assert "pg_locks" in payload["results"][0]["text"]
+
+
+def test_who_touched_over_mcp_returns_the_same_payload(archive):
+    frame = mcp.dispatch(archive, {
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {"name": "who_touched", "arguments": {"path": "ledger.py"}}})
+    assert "error" not in frame
+    payload = json.loads(frame["result"]["content"][0]["text"])
+    assert payload["count"] == 2
+
+
+def test_who_touched_over_mcp_rejects_an_empty_path(archive):
+    """A bad argument comes back as an isError RESULT, not a protocol error, so the
+    model can read what went wrong and try again."""
+    frame = mcp.dispatch(archive, {
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "who_touched", "arguments": {"path": "  "}}})
+    assert frame["result"]["isError"] is True
+
+
+def test_who_touched_json_with_no_matches_is_still_json(data_dir):
+    """`nothing touched that` on stdout would break every consumer of --json."""
+    result = run_cli(data_dir, "who-touched", "zzznothinghere", "--json")
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 0 and payload["results"] == []
+
+
+def test_commands_json_with_no_matches_is_still_json(data_dir):
+    result = run_cli(data_dir, "commands", "zzznothinghere", "--json")
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 0 and payload["results"] == []
+
+
+def test_who_touched_cli_prints_the_sessions(data_dir):
+    result = run_cli(data_dir, "who-touched", "ledger.py")
+    assert result.exit_code == 0
+    assert "Rewrote the ledger helper" in result.stdout
+
+
+def test_commands_cli_ranks_programs_with_no_argument(data_dir):
+    result = run_cli(data_dir, "commands")
+    assert result.exit_code == 0
+    assert "psql" in result.stdout

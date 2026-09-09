@@ -7,6 +7,7 @@ against this vocabulary regardless of which of the ten sources produced it.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Protocol
 
@@ -54,10 +55,43 @@ class Part:
     blob_path: str | None = None   # where BlobStore put it
     embed_eligible: bool = False   # the §1.1 rule, materialised
     duration_ms: int | None = None # tool_use only: call -> matching result, when timed
+    # tool_use only: the call's ARGUMENTS, as the source recorded them. `text` is a
+    # short line of intent; this is what touched_file and command are derived from.
+    tool_input: str | None = None
+    tool_input_sha: str | None = None   # sha256 when the payload overflowed to a blob
+    tool_input_path: str | None = None  # where BlobStore put it
+    tool_input_bytes: int = 0           # TRUE size, even when `tool_input` is truncated
 
     def __post_init__(self) -> None:
         if not self.bytes and self.text:
             self.bytes = len(self.text.encode("utf-8", errors="replace"))
+
+
+def attach_tool_input(part: Part, payload, blobs=None) -> Part:
+    """Store a tool call's arguments on the part, offloading an oversized one.
+
+    Adapters summarise the payload into `part.text` for a human to read and for FTS to
+    index; that summary is lossy on purpose. This keeps the arguments themselves, which
+    is what `llma who-touched` and `llma commands` are computed from.
+
+    `blobs` is duck-typed on `.put_text` so this module keeps its zero local imports.
+    """
+    if payload is None:
+        return part
+    text = payload if isinstance(payload, str) else json.dumps(
+        payload, ensure_ascii=False, default=str)
+    part.tool_input_bytes = len(text.encode("utf-8", errors="replace"))
+    if part.tool_input_bytes > INLINE_LIMIT and blobs is not None:
+        stored = blobs.put_text(text)
+        if stored:
+            sha, size, dest = stored
+            part.tool_input_sha, part.tool_input_path = sha, dest
+            part.tool_input_bytes = size
+            # A truncated head does not parse as JSON, and the derivation says so
+            # rather than guessing -- see search/facts.py.
+            text = text[:INLINE_LIMIT]
+    part.tool_input = text
+    return part
 
 
 @dataclass(slots=True)

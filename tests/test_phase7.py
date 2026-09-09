@@ -534,3 +534,56 @@ def test_v5_archive_migrates_to_v6(tmp_path):
     cols = {r["name"] for r in con.execute("PRAGMA table_info(part)")}
     assert "redacted" in cols
     assert con.execute("SELECT COUNT(*) FROM redaction").fetchone()[0] == 0
+
+
+def test_a_secret_in_a_tool_payload_is_redacted_too(tmp_path):
+    """A Bash payload is the single most leak-prone content in the archive -- it is
+    where `export AWS_SECRET=...` actually lives -- and `command.text` is printed by
+    the CLI, the web UI and the MCP server. Scanning only `part.text` would leave the
+    secret in the column the derived tables are computed from."""
+    from llm_archive.core import db, redact
+    from llm_archive.core.models import Message, Part, Session
+
+    con = db.connect(tmp_path / "a.db")
+    src = db.source_id(con, "claude_code", "Claude Code", "cli")
+    secret = "ghp_" + "a" * 36
+    part = Part(kind="tool_use", seq=0, text="command: deploy.sh", tool_name="Bash")
+    part.tool_input = '{"command": "GITHUB_TOKEN=' + secret + ' ./deploy.sh"}'
+    msg = Message(native_id="m1", role="assistant", created_at=1, seq=0)
+    msg.parts.append(part)
+    db.upsert_session(con, src, Session(
+        source_kind="claude_code", native_id="s1", started_at=1,
+        raw_path="x", raw_hash="h", messages=[msg]))
+
+    stored = con.execute("SELECT tool_input FROM part").fetchone()[0]
+    assert secret in stored, "fixture is wrong; the payload never reached the column"
+
+    result = redact.apply(con)
+    assert result.secrets >= 1
+
+    after = con.execute("SELECT text, tool_input, redacted FROM part").fetchone()
+    assert secret not in after["tool_input"]
+    assert "[redacted:" in after["tool_input"]
+    assert after["redacted"] >= 1
+    assert after["text"] == "command: deploy.sh"   # the summary is untouched
+
+
+def test_redaction_leaves_a_part_with_no_payload_alone(tmp_path):
+    """Most parts are plain text with tool_input NULL; the wider scan must not write
+    an empty string over them."""
+    from llm_archive.core import db, redact
+    from llm_archive.core.models import Message, Part, Session
+
+    con = db.connect(tmp_path / "b.db")
+    src = db.source_id(con, "claude_code", "Claude Code", "cli")
+    secret = "ghp_" + "b" * 36
+    msg = Message(native_id="m1", role="user", created_at=1, seq=0)
+    msg.parts.append(Part(kind="text", seq=0, text=f"my key is {secret}"))
+    db.upsert_session(con, src, Session(
+        source_kind="claude_code", native_id="s1", started_at=1,
+        raw_path="x", raw_hash="h", messages=[msg]))
+
+    redact.apply(con)
+    row = con.execute("SELECT text, tool_input FROM part").fetchone()
+    assert secret not in row["text"]
+    assert row["tool_input"] is None
