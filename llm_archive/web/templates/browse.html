@@ -99,7 +99,11 @@
       <tbody>
         {% for item in rows %}
           <tr>
-            <td><a href="/session/{{ item.r.id }}">{{ item.r.title or "(untitled)" }}</a></td>
+            <td><a href="/session/{{ item.r.id }}">{{ item.r.title or "(untitled)" }}</a>
+                {% if item.target and item.target.mode == "url" and not item.target.blocked %}
+                  <a class="row-open" href="{{ item.target.url }}" target="_blank"
+                     rel="noopener" title="{{ item.target.label }}">↗</a>
+                {% endif %}</td>
             <td><span class="chip src-{{ item.r.source_kind }}">{{ item.r.source_kind }}</span>
                 {% if item.r.participant %}<span class="chip">{{ item.r.participant }}</span>{% endif %}</td>
             <td>{{ item.r.model_primary or "—" }}

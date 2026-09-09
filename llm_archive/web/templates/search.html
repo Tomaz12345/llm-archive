@@ -47,6 +47,13 @@
         <a class="hit-title" href="/session/{{ h.session_id }}?q={{ q|urlencode }}">
           {{ h.title or "(untitled)" }}
         </a>
+        {# Only link targets get the arrow. A terminal launch from a result row is one
+           mis-click away from a window you did not ask for; that button lives on the
+           session page, where you have already chosen the session. #}
+        {% if item.target and item.target.mode == "url" and not item.target.blocked %}
+          <a class="hit-open" href="{{ item.target.url }}" target="_blank" rel="noopener"
+             title="{{ item.target.label }}">↗</a>
+        {% endif %}
         <div class="hit-meta">
           <span class="chip src-{{ h.source }}">{{ h.source }}</span>
           <span>{{ item.when }}</span>

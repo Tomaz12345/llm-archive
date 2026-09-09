@@ -22,6 +22,7 @@ from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
+    JSONResponse,
     PlainTextResponse,
     RedirectResponse,
     StreamingResponse,
@@ -29,7 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from ..core import db, idb, ingest
+from ..core import db, idb, ingest, reopen
 from ..core.blobs import IMAGE_MIMES, BlobStore, blob_path, sniff_file
 from ..export.render import (
     caption_of as _caption,
@@ -235,10 +236,14 @@ def create_app(data_dir: Path | None = None, *,
                 hits = [h for h in hits if h.session_id in keep_mt]
 
         terms = _terms(q)
+        # A `Hit` carries no native_id or meta, so the reopen targets come from one
+        # extra query over the hit ids rather than from widening the search stack.
+        targets = reopen.targets_for(con, [h.session_id for h in hits])
         rendered = [{
             "hit": h,
             "when": _fmt(h.started_at),
             "tags": _tags_for(con, h.session_id),
+            "target": targets.get(h.session_id),
             "snippets": [{
                 "role": s.role, "kind": s.kind,
                 "html": _highlight(_condense(s.text), terms),
@@ -265,7 +270,7 @@ def create_app(data_dir: Path | None = None, *,
         con = connect()
         meta = con.execute("""
             SELECT s.*, src.kind AS source_kind, src.label AS source_label,
-                   COALESCE(w.label,'') AS workspace,
+                   COALESCE(w.label,'') AS workspace, w.key AS workspace_key,
                    json_extract(s.meta,'$.participant_label') AS participant
             FROM session s JOIN source src ON src.id = s.source_id
             LEFT JOIN workspace w ON w.id = s.workspace_id
@@ -352,9 +357,20 @@ def create_app(data_dir: Path | None = None, *,
                         f'("{meta["title"] or "(untitled)"}") from my llm-archive and '
                         'publish it as a shared link.')
 
+        # Where this conversation still lives — a provider URL, a vscode:// hand-off, or
+        # a terminal this server can spawn. See `core/reopen.py` for why some are refused.
+        target = reopen.resolve(meta)
+        # `json.dumps` for the same reason `share_prompt` uses it: a cwd is archive text
+        # heading straight into a JS string literal.
+        copy_cmd_json = json.dumps(target.copy_text or "")
+
         return templates.TemplateResponse(request, "session.html", {
             "totals": totals(con),
-            "meta": meta, "messages": messages,
+            "meta": meta, "messages": messages, "target": target,
+            "copy_cmd_json": copy_cmd_json,
+            # only set when the provider itself says the thread is archived, so the
+            # badge means "hidden in their sidebar", not "old"
+            "archived": (target.warn if target.warn == reopen.ARCHIVED_WARN else None),
             "model_type": model_types.classify(meta["model_primary"]),
             "when": _fmt(meta["started_at"], time=True),
             "tags": _tags_for(con, session_id),
@@ -498,6 +514,42 @@ def create_app(data_dir: Path | None = None, *,
                      ("inline" if inline else f'attachment; filename="{sha[:16]}.bin"'),
                      "Cache-Control": "private, max-age=86400"})
 
+    @app.post("/session/{session_id}/open")
+    def open_session(request: Request, session_id: int):
+        """Spawn a terminal already inside a CLI session — `claude --resume <id>` and
+        friends, in the directory that session actually ran in.
+
+        This is the only endpoint in the app that starts a process, so it is deliberately
+        narrow. The target is re-resolved from the database on every call: nothing about
+        the command, its arguments or its directory is ever taken from the request, so
+        the worst a caller can do is ask for a session id.
+
+        There is no CSRF token anywhere in this app — every other POST is a plain form —
+        so `Sec-Fetch-Site` carries the weight instead. Browsers set it on their own and
+        a page cannot forge it, and `fetch` from this UI sends `same-origin`. A missing
+        header means a client that is not a browser (curl, a test), which is fine; a
+        cross-site one means some other page tried, which is not.
+        """
+        site = request.headers.get("sec-fetch-site")
+        if site is not None and site not in ("same-origin", "none"):
+            return JSONResponse({"error": "cross-site requests cannot open sessions"},
+                                status_code=403)
+
+        target = reopen.target_for(connect(), session_id)
+        if target is None:
+            return JSONResponse({"error": f"no session #{session_id}"}, status_code=404)
+        if target.mode != "launch":
+            return JSONResponse(
+                {"error": "this session opens with a link, not a terminal",
+                 "url": target.url}, status_code=400)
+        if target.blocked:
+            return JSONResponse({"error": target.blocked}, status_code=409)
+        try:
+            reopen.launch(target)
+        except reopen.LaunchError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse({"opened": target.display, "cwd": target.cwd})
+
     @app.post("/session/{session_id}/tag")
     def add_tag(session_id: int, name: str = Form(...)):
         name = name.strip()
@@ -634,8 +686,10 @@ def create_app(data_dir: Path | None = None, *,
             LEFT JOIN workspace w ON w.id = s.workspace_id {where}""",
             tuple(params)).fetchone()["n"]
 
+        targets = reopen.targets_for(con, [r["id"] for r in rows])
         return templates.TemplateResponse(request, "browse.html", {
             "rows": [{"r": r, "when": _fmt(r["started_at"]),
+                      "target": targets.get(r["id"]),
                       "model_type": model_types.classify(r["model_primary"])}
                      for r in rows],
             "facets": facets(con), "totals": totals(con), "count": count,

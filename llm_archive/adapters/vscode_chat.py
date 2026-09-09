@@ -98,24 +98,31 @@ class VSCodeChatAdapter:
         return found
 
     @staticmethod
-    def _workspace_for(path: Path) -> tuple[str | None, str | None, str | None]:
-        """Resolve (workspace_key, label, remote_host) from workspace.json.
+    def _workspace_for(path: Path) -> tuple[str | None, str | None, str | None,
+                                            str | None]:
+        """Resolve (workspace_key, label, remote_host, folder) from workspace.json.
 
         VS Code stores chats for **remote** sessions on the local disk, tagged with a
         `vscode-remote://ssh-remote+<authority>/…` folder URI. So a laptop's worth of
         work done over SSH is already here — it just needs attributing to the machine it
         actually ran on rather than to this desktop.
+
+        The fourth element is that folder with its case intact. `derive_workspace`
+        casefolds, which is what makes six spellings of one project collapse into one
+        workspace row — and is exactly wrong for handing the path back to VS Code over
+        SSH, where `/home/tomaz/Wall_E` and `/home/tomaz/wall_e` are different
+        directories. See `core/reopen.py`.
         """
         meta = path.parent.parent / "workspace.json"
         if not meta.exists():
-            return None, None, None
+            return None, None, None, None
         try:
             data = json.loads(meta.read_text(encoding="utf-8", errors="replace"))
         except (json.JSONDecodeError, OSError):
-            return None, None, None
+            return None, None, None, None
         uri = data.get("folder") or data.get("workspace")
         if not isinstance(uri, str):
-            return None, None, None
+            return None, None, None, None
 
         folder = unquote(uri)
         remote_host = None
@@ -136,7 +143,7 @@ class VSCodeChatAdapter:
         if len(folder) > 1 and folder[1] == "%3A":
             folder = folder.replace("%3A", ":", 1)
         key, label = derive_workspace(Counter({folder: 1}))
-        return key, label, remote_host
+        return key, label, remote_host, folder
 
     @staticmethod
     def _participant(data: dict, requests: list) -> tuple[str | None, str | None]:
@@ -243,7 +250,7 @@ class VSCodeChatAdapter:
         stats.sessions += 1
 
         participant, participant_label = self._participant(data, requests)
-        ws_key, ws_label, remote_host = self._workspace_for(path)
+        ws_key, ws_label, remote_host, folder_uri = self._workspace_for(path)
         title = data.get("customTitle") or None
         times = [m.created_at for m in messages if m.created_at]
 
@@ -271,6 +278,8 @@ class VSCodeChatAdapter:
                 "extension": ((model_meta.get("extension") or {}).get("value")
                               if isinstance(model_meta.get("extension"), dict) else None),
                 "requests": len(requests),
+                # the workspace path with its case intact, for reopening in VS Code
+                "folder_uri": folder_uri,
             }.items() if v is not None},
         )
 

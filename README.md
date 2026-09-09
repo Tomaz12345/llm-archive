@@ -47,6 +47,13 @@ credentials are stored and no session is fetched on your behalf.
 **Local web UI.** `llma serve` — faceted browse by source / workspace / model / machine /
 tag, full transcript view, and a statistics dashboard with token and cost breakdowns.
 
+**Back to where it came from.** Every session links to the live conversation: the chat in
+your browser, the workspace in VS Code, or a terminal opened in the directory that agent
+session ran in, already resumed. The URL templates are rebuilt from the id each provider
+put in its export, so nothing extra is stored. When a session cannot be reached — recorded
+on another machine, or from an export that carries no conversation id — it says which,
+rather than offering a link that 404s.
+
 **Your agents can read it too.** `llma mcp` serves the archive to any MCP client over
 stdio — `search`, `show` and `related`, all read-only — so Claude Code can answer *"have
 I solved this before?"* mid-session instead of you alt-tabbing to the web UI. The
@@ -133,6 +140,8 @@ Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
 llma show 412 --tools             # one session as a transcript
 llma show 412 --json              # ... as a JSON document
 llma related 412                  # sessions most like it; the session is the query
+llma open 412                     # reopen it: browser, VS Code, or a resumed terminal
+llma open 412 --print             # ... just say where it lives, and open nothing
 
 llma serve                        # web UI on http://127.0.0.1:8787
 llma serve --no-fetch-images      # ... without the startup image backfill
@@ -187,6 +196,13 @@ More: [automation](docs/automation.md) · [multi-machine](docs/multi-machine.md)
 `data/` is the highest-value secret on the machine — chat logs, tool output, private code,
 and any API key that leaked into them, all concentrated into one searchable place. It is
 in `.gitignore` and must never reach a remote. Do not expose `llma serve` beyond localhost.
+
+That last point is load-bearing since `llma serve` grew a "resume in terminal" button:
+`POST /session/<id>/open` starts a process on this machine. It takes a session id and
+nothing else — the command, its arguments and its directory are re-read from the database
+every time, never from the request — it runs an argv list rather than a shell string, it
+refuses anything recorded on another host, and it rejects cross-site requests. It is still
+one more reason the server binds to 127.0.0.1 and should stay there.
 
 `llma mcp` changes nothing about that. It is read-only — every tool is a SELECT — and it
 talks over the pipe its client spawned it on, not a port. What it does change is *who*

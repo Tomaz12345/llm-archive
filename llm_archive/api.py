@@ -26,6 +26,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .core import reopen
 from .search.hybrid import Filters, Hit, related as run_related, search as run_search
 
 # Ceilings, all overridable per call. A snippet is a hook to decide whether to open the
@@ -51,8 +52,10 @@ TEXT_KINDS = ("text", "thinking")
 _META = """
     SELECT s.id, s.title, s.started_at, s.ended_at, s.host, s.model_primary,
            s.msg_count, s.turn_count, s.tok_in, s.tok_out, s.tok_cache_read,
-           s.tok_cache_write, s.cost_usd, s.raw_path, s.meta,
-           src.kind AS source, COALESCE(w.label,'') AS workspace
+           s.tok_cache_write, s.cost_usd, s.raw_path, s.meta, s.native_id,
+           s.parent_session_id,
+           src.kind AS source, COALESCE(w.label,'') AS workspace,
+           w.key AS workspace_key
     FROM session s
     JOIN source src ON src.id = s.source_id
     LEFT JOIN workspace w ON w.id = s.workspace_id
@@ -112,11 +115,15 @@ def session_brief(row: sqlite3.Row) -> dict:
                    "cache_write": row["tok_cache_write"]},
         "cost_usd": row["cost_usd"],
         "raw_path": row["raw_path"],
+        # Where the conversation still lives, so a reader can cite the real thread
+        # rather than an archive id — or be told plainly that it cannot be reached.
+        "open": reopen.resolve(row).as_dict(),
     }
 
 
-def _hit(hit: Hit, snippet_chars: int) -> dict:
-    return {
+def _hit(hit: Hit, snippet_chars: int,
+         targets: dict[int, reopen.Target] | None = None) -> dict:
+    payload = {
         "session_id": hit.session_id,
         "title": hit.title,
         "source": hit.source,
@@ -129,6 +136,17 @@ def _hit(hit: Hit, snippet_chars: int) -> dict:
                       **_text(s.text, snippet_chars)}
                      for s in hit.snippets],
     }
+    # A `Hit` knows nothing about native ids, so the targets are resolved in one query
+    # by the caller and handed in here rather than looked up per result.
+    target = (targets or {}).get(hit.session_id)
+    if target is not None:
+        payload["open"] = target.as_dict()
+    return payload
+
+
+def _hits(con: sqlite3.Connection, hits: list[Hit], snippet_chars: int) -> list[dict]:
+    targets = reopen.targets_for(con, [h.session_id for h in hits])
+    return [_hit(h, snippet_chars, targets) for h in hits]
 
 
 def search_payload(con: sqlite3.Connection, vectors_dir: Path, query: str, *,
@@ -137,7 +155,7 @@ def search_payload(con: sqlite3.Connection, vectors_dir: Path, query: str, *,
                    snippet_chars: int = SNIPPET_CHARS) -> dict:
     hits = run_search(con, vectors_dir, query, limit=limit, filters=filters, mode=mode)
     return {"query": query, "mode": mode, "count": len(hits),
-            "results": [_hit(h, snippet_chars) for h in hits]}
+            "results": _hits(con, hits, snippet_chars)}
 
 
 def related_payload(con: sqlite3.Connection, vectors_dir: Path, session_id: int, *,
@@ -151,7 +169,7 @@ def related_payload(con: sqlite3.Connection, vectors_dir: Path, session_id: int,
     hits = run_related(con, vectors_dir, session_id, limit=limit,
                        filters=filters, mode=mode)
     return {"session": session_brief(row), "mode": mode, "count": len(hits),
-            "results": [_hit(h, snippet_chars) for h in hits]}
+            "results": _hits(con, hits, snippet_chars)}
 
 
 def session_payload(con: sqlite3.Connection, session_id: int, *,

@@ -179,6 +179,23 @@ code, pre, .path { font-family: ui-monospace, "Cascadia Mono", Consolas, monospa
 .rtools { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 10px; font-size: 12.5px; }
 .rtools .path { color: var(--rule-2); font-size: 11px; margin-left: auto; word-break: break-all; }
 
+/* "open where it came from" — the first control in the bar, so it reads as the way
+   back out of the archive rather than as one more export format. */
+.rtools .open {
+  font: inherit; color: var(--accent); background: var(--accent-soft);
+  border: 1px solid transparent; border-radius: 4px;
+  padding: 3px 9px; cursor: pointer; text-decoration: none;
+}
+.rtools .open:hover { border-color: var(--accent); }
+.rtools button.open[disabled] { opacity: .6; cursor: default; }
+.rtools .warnmark { color: var(--warm); }
+.open-blocked { color: var(--muted); cursor: help; border-bottom: 1px dotted var(--rule-2); }
+
+/* the jump-out arrow on a result row: present enough to click, quiet enough that it
+   never competes with the title it sits beside */
+.hit-open, .row-open { color: var(--muted); text-decoration: none; padding: 0 4px; }
+.hit-open:hover, .row-open:hover { color: var(--accent); }
+
 .tagbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
 .tagbar input {
   padding: 4px 8px; font-size: 12.5px; background: var(--surface);

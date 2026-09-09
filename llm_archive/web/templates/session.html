@@ -7,6 +7,9 @@
     <h1>{{ meta.title or "(untitled)" }}</h1>
     <div class="hit-meta">
       <span class="chip src-{{ meta.source_kind }}">{{ meta.source_label }}</span>
+      {% if archived %}
+        <span class="tag" title="{{ archived }}">archived there</span>
+      {% endif %}
       {% if meta.participant %}<span class="chip">{{ meta.participant }}</span>{% endif %}
       <span>{{ when }}</span>
       {% if meta.workspace %}<span>· {{ meta.workspace }}</span>{% endif %}
@@ -31,6 +34,35 @@
     </div>
 
     <div class="rtools">
+      {# Back to where this conversation still lives. A web chat and a VS Code workspace
+         are plain links the browser hands off; a CLI session needs the server to spawn a
+         terminal, so it posts. Blocked targets stay visible with the reason — knowing
+         why you cannot get back is worth more than a link that 404s. #}
+      {% if target.blocked %}
+        <span class="open-blocked" title="{{ target.blocked }}">
+          can’t reopen ⓘ
+        </span>
+        {# Blocked here is not blocked everywhere: a session recorded on the laptop, or
+           one whose agent lives elsewhere on PATH, still has exactly the right command
+           to paste over there. #}
+        {% if target.display %}
+          <a href="#" class="copy-cmd" data-copy="{{ copy_cmd_json }}"
+             title="{{ target.display }}  (in {{ target.cwd }})">copy command</a>
+        {% endif %}
+      {% elif target.mode == "url" %}
+        <a class="open" href="{{ target.url }}" target="_blank" rel="noopener"
+           title="{{ target.warn or target.url }}">
+          {{ target.label }}{% if target.warn %} <span class="warnmark">⚠</span>{% endif %}
+        </a>
+      {% else %}
+        <button class="open" data-open="/session/{{ meta.id }}/open"
+                title="{{ target.display }}  (in {{ target.cwd }})">
+          {{ target.label }}
+        </button>
+        <a href="#" class="copy-cmd" data-copy="{{ copy_cmd_json }}"
+           title="copy the command instead of running it here">copy command</a>
+      {% endif %}
+
       {% set base = "/session/" ~ meta.id ~ "?q=" ~ (q|urlencode) %}
       <a href="{{ base }}&tools={{ 'false' if tools else 'true' }}&abandoned={{ 'true' if abandoned else 'false' }}">
         {{ "hide" if tools else "show" }} tool calls
@@ -155,19 +187,57 @@
 </div>
 
 <script>
-// The only script on this page: there's no server-side "publish", since the tool that
-// turns a file into a shared link only exists inside a Claude agent session. So this
-// copies the ask instead of a URL, for pasting into one.
+// Two small behaviours, both clipboard-or-fetch on a single element.
 (function () {
-  var link = document.querySelector(".share-link");
-  if (!link || !navigator.clipboard) return;
-  var label = link.textContent;
-  link.addEventListener("click", function (ev) {
-    ev.preventDefault();
-    navigator.clipboard.writeText(JSON.parse(link.dataset.prompt)).then(function () {
-      link.textContent = "copied — paste into Claude Code";
-      setTimeout(function () { link.textContent = label; }, 2500);
+  // Flash a message on a control, then put its label back.
+  function flash(el, message) {
+    var label = el.textContent;
+    el.textContent = message;
+    setTimeout(function () { el.textContent = label; }, 2500);
+  }
+
+  function onCopy(el, text) {
+    if (!el || !navigator.clipboard) return;
+    el.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      navigator.clipboard.writeText(text()).then(function () {
+        flash(el, "copied");
+      });
     });
+  }
+
+  // There's no server-side "publish", since the tool that turns a file into a shared
+  // link only exists inside a Claude agent session. So this copies the ask, not a URL.
+  var share = document.querySelector(".share-link");
+  if (share && navigator.clipboard) {
+    var shareLabel = share.textContent;
+    share.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      navigator.clipboard.writeText(JSON.parse(share.dataset.prompt)).then(function () {
+        share.textContent = "copied — paste into Claude Code";
+        setTimeout(function () { share.textContent = shareLabel; }, 2500);
+      });
+    });
+  }
+
+  var copy = document.querySelector(".copy-cmd");
+  if (copy) onCopy(copy, function () { return JSON.parse(copy.dataset.copy); });
+
+  // A CLI session can't be reached by a link — the server has to spawn the terminal.
+  // Failures come back as JSON with a reason, which belongs on the button rather than
+  // in a console nobody has open.
+  var open = document.querySelector("button.open[data-open]");
+  if (!open) return;
+  open.addEventListener("click", function () {
+    open.disabled = true;
+    fetch(open.dataset.open, { method: "POST" })
+      .then(function (r) { return r.json().then(function (b) { return [r.ok, b]; }); })
+      .then(function (pair) {
+        flash(open, pair[0] ? "opened" : (pair[1].error || "could not open"));
+        if (!pair[0]) open.title = pair[1].error || open.title;
+      })
+      .catch(function (err) { flash(open, String(err)); })
+      .then(function () { open.disabled = false; });
   });
 })();
 </script>

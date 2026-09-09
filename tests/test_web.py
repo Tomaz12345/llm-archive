@@ -14,7 +14,7 @@ import sqlite3
 import pytest
 from starlette.testclient import TestClient
 
-from llm_archive.core import db
+from llm_archive.core import db, reopen
 from llm_archive.core.models import Message, Part, Session
 from llm_archive.search import fts
 from llm_archive.web.app import _highlight, create_app
@@ -27,6 +27,8 @@ def client(tmp_path, monkeypatch):
     con = db.connect(data / "archive.db")
     src = db.source_id(con, "claude_code", "Claude Code", "cli")
     panel = db.source_id(con, "vscode_chat", "VS Code chat", "editor_panel")
+    t3 = db.source_id(con, "t3chat", "T3 Chat", "web")
+    orouter = db.source_id(con, "openrouter", "OpenRouter", "web")
 
     def add(native, title, texts, workspace="proj", host="box",
             source=None, kind="claude_code", meta=None):
@@ -55,6 +57,21 @@ def client(tmp_path, monkeypatch):
         ("assistant", "renamed it", "text")],
         source=panel, kind="vscode_chat", meta={"participant": "copilot",
                                                 "participant_label": "GitHub Copilot"})
+    # #4-#6 exist for the reopen links: a web chat that has a URL, one whose export
+    # carries no conversation id, and a CLI session whose recorded cwd is real.
+    add("db0ee0a2-d373-452b-9617-f6bd406e10e0", "Archived thread", [
+        ("user", "a question I asked T3", "text"),
+        ("assistant", "an answer", "text")],
+        workspace=None, host=None, source=t3, kind="t3chat",
+        meta={"visibility": "archived"})
+    add("msg-1787652204-7U7e1MmNVDmK", "Exported from OpenRouter", [
+        ("user", "compare these models", "text"),
+        ("assistant", "here is the comparison", "text")],
+        workspace=None, host=None, source=orouter, kind="openrouter")
+    add("resumable", "Local agent run", [
+        ("user", "fix the failing test", "text"),
+        ("assistant", "fixed", "text")],
+        meta={"cwds": {str(tmp_path): 4}})
     con.commit()
     fts.rebuild(con)
     con.close()
@@ -315,3 +332,120 @@ def test_keyword_only_build_reads_as_current_with_a_caveat(client, tmp_path):
     assert "Up to date" in stats
     assert "--no-vectors" in stats
     assert "Search index is out of date" not in client.get("/?q=offside").text
+
+
+# ------------------------------------------------------ reopening a session
+
+def test_a_web_chat_links_back_to_the_provider(client):
+    r = client.get("/session/4")
+    assert "https://t3.chat/chat/db0ee0a2-d373-452b-9617-f6bd406e10e0" in r.text
+    assert "open in T3 Chat" in r.text
+
+
+def test_an_archived_thread_is_badged_but_still_linked(client):
+    """Archiving hides a thread from the sidebar at the provider; it does not delete
+    it. Dropping the link on those would drop it on most of the T3 Chat archive."""
+    r = client.get("/session/4").text
+    assert "archived there" in r
+    assert "https://t3.chat/chat/" in r
+
+
+def test_a_session_that_cannot_be_reopened_says_why(client):
+    r = client.get("/session/5").text
+    assert "can’t reopen" in r
+    assert "no conversation id" in r
+
+
+def test_a_local_agent_session_offers_a_terminal_not_a_link(client, monkeypatch):
+    monkeypatch.setattr(reopen, "_local_host", lambda: "box")
+    monkeypatch.setattr(reopen.shutil, "which", lambda name: f"/bin/{name}")
+    r = client.get("/session/6").text
+    assert "resume in Claude Code" in r
+    assert "/session/6/open" in r
+    assert "claude --resume resumable" in r
+
+
+def test_a_blocked_session_still_offers_the_command_when_there_is_one(
+        client, monkeypatch):
+    """#6 is recorded on "box"; from anywhere else the button cannot run it, but the
+    command is still the right one to paste over there."""
+    monkeypatch.setattr(reopen, "_local_host", lambda: "somewhere-else")
+    r = client.get("/session/6").text
+    assert "can’t reopen" in r
+    assert "copy command" in r
+
+
+def test_a_blocked_session_with_no_command_offers_nothing_to_copy(client):
+    """OpenRouter has no URL and no command — there is nothing to hand over."""
+    r = client.get("/session/5").text
+    assert "can’t reopen" in r
+    assert "copy command" not in r
+
+
+def test_browse_links_out_for_web_sessions_only(client):
+    """A terminal launch from a result row is one mis-click from a window nobody
+    asked for, so only URL targets get the jump-out arrow."""
+    assert "row-open" in client.get("/browse?source=t3chat").text
+    assert "row-open" not in client.get("/browse?source=claude_code").text
+
+
+def test_search_results_link_out(client):
+    assert "hit-open" in client.get("/?q=T3&mode=keyword").text
+
+
+# ------------------------------------------------- POST /session/{id}/open
+
+def _launched(monkeypatch):
+    """Capture the launch instead of spawning a terminal in the test suite."""
+    calls = []
+    monkeypatch.setattr(reopen, "_local_host", lambda: "box")
+    monkeypatch.setattr(reopen.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(reopen, "launch", calls.append)
+    return calls
+
+
+def test_open_launches_a_local_session(client, monkeypatch, tmp_path):
+    calls = _launched(monkeypatch)
+    r = client.post("/session/6/open")
+    assert r.status_code == 200
+    assert calls and calls[0].argv == ("claude", "--resume", "resumable")
+    assert calls[0].cwd == str(tmp_path)
+
+
+def test_open_refuses_a_cross_site_request(client, monkeypatch):
+    """The only endpoint here that starts a process, and there is no CSRF token
+    anywhere in this app — so the header the browser sets on its own carries it."""
+    calls = _launched(monkeypatch)
+    r = client.post("/session/6/open", headers={"Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 403
+    assert not calls
+
+
+def test_open_allows_the_uis_own_fetch(client, monkeypatch):
+    calls = _launched(monkeypatch)
+    assert client.post("/session/6/open",
+                       headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+    assert calls
+
+
+def test_open_refuses_a_session_from_another_machine(client, monkeypatch):
+    calls = _launched(monkeypatch)
+    monkeypatch.setattr(reopen, "_local_host", lambda: "somewhere-else")
+    r = client.post("/session/6/open")
+    assert r.status_code == 409
+    assert "somewhere-else" not in r.json()["error"]   # names the recording host, not this one
+    assert "box" in r.json()["error"]
+    assert not calls
+
+
+def test_open_refuses_a_session_that_opens_with_a_link(client, monkeypatch):
+    calls = _launched(monkeypatch)
+    r = client.post("/session/4/open")
+    assert r.status_code == 400
+    assert r.json()["url"].startswith("https://t3.chat/")
+    assert not calls
+
+
+def test_open_on_an_unknown_session_is_404(client, monkeypatch):
+    _launched(monkeypatch)
+    assert client.post("/session/999999/open").status_code == 404

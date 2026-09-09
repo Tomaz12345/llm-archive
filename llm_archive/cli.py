@@ -561,6 +561,50 @@ def show(
         typer.echo(body[:4000])
 
 
+@app.command("open")
+def open_cmd(
+    session_id: int = typer.Argument(..., help="session id from search results"),
+    print_only: bool = typer.Option(False, "--print",
+                                    help="show where it lives without opening it"),
+    json_out: bool = typer.Option(False, "--json", help="emit the target as JSON"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Reopen a session where it came from.
+
+    A web chat opens in the browser, a VS Code panel opens its workspace, and a CLI
+    session opens a terminal in the directory it ran in, already resumed. Sessions that
+    cannot be reached — recorded on another machine, or from a provider whose export
+    carries no conversation id — say so and exit non-zero rather than guessing a URL.
+    """
+    from .core import reopen
+
+    con, _, _ = _open(data_dir)
+    target = reopen.target_for(con, session_id)
+    if target is None:
+        typer.echo(f"no session #{session_id}")
+        raise typer.Exit(1)
+
+    if json_out:
+        _echo_json(target.as_dict())
+        raise typer.Exit(0 if target.ok else 1)
+
+    typer.echo(reopen.describe(target))
+    if print_only:
+        raise typer.Exit(0 if target.ok else 1)
+    if target.blocked:
+        raise typer.Exit(1)
+
+    if target.mode == "url":
+        import webbrowser
+        webbrowser.open(target.url)
+        return
+    try:
+        reopen.launch(target)
+    except reopen.LaunchError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from None
+
+
 @app.command("export")
 def export_cmd(
     session_id: int = typer.Argument(

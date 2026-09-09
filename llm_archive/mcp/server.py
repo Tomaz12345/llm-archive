@@ -98,7 +98,10 @@ TOOLS = [
             "everything including tool output, plus local embeddings), so a paraphrase "
             "finds a session that used entirely different words, and a query in one "
             "language finds a conversation held in another. Returns ranked sessions "
-            "with the snippets that matched; pass a session_id to `show` to read one.",
+            "with the snippets that matched; pass a session_id to `show` to read one. "
+            "Each result also carries `open`: where that conversation still "
+            "lives — the provider URL, or the reason it cannot be reached — so "
+            "you can cite the real thread rather than an archive id.",
         "inputSchema": {
             "type": "object",
             "properties": {
