@@ -42,6 +42,12 @@ surrounding conversation still attached — 7,000 commands here, kept whole rath
 truncated to a preview. Paths are normalised across Windows, WSL and remote SSH, so a
 file edited from two machines is one row and not two.
 
+**A git blame that ends at a conversation.** `llma blame src/db.py:137` runs git blame
+for the line, then carries on where git stops: each commit behind the range is joined
+to the sessions that edited that file between the previous commit touching it and this
+one, and to the session that ran the `git commit`. The commit message is one line; the
+session is the reasoning behind it. Lines not committed yet are attributed too.
+
 **Grouping you do not have to maintain.** Sessions are clustered into topic groups from
 their own embeddings and labelled from their own vocabulary, so browsing by subject works
 without anyone tagging anything. And a conversation resumed into a fresh transcript --
@@ -72,8 +78,9 @@ on another machine, or from an export that carries no conversation id — it say
 rather than offering a link that 404s.
 
 **Your agents can read it too.** `llma mcp` serves the archive to any MCP client over
-stdio — `search`, `show` and `related`, all read-only — so Claude Code can answer *"have
-I solved this before?"* mid-session instead of you alt-tabbing to the web UI. The
+stdio — search, show, related, who-touched, blame and commands, all read-only — so Claude
+Code can answer *"have I solved this before?"* and *"why is this line like this?"*
+mid-session instead of you alt-tabbing to the web UI. The
 transport is a pipe: no socket, no key, nothing leaves the machine. Everything the tools
 return is also on the CLI as `--json`.
 
@@ -167,6 +174,8 @@ llma who-touched core/db.py --writes   # ... only the ones that changed it
 llma commands                     # what you actually run, ranked
 llma commands "alembic upgrade"   # every time you ran it, and where
 llma commands -p git --workspace payments-api
+llma blame src/db.py:137          # the commit behind a line, and the session behind that
+llma blame src/db.py -L 120,140   # ... for a range; omit both for the whole file
 
 llma serve                        # web UI on http://127.0.0.1:8787
 llma serve --no-fetch-images      # ... without the startup image backfill
@@ -183,11 +192,12 @@ llma export --workspace payments-api --zip --out ./out
 claude mcp add llm-archive -- llma mcp
 ```
 
-That registers a stdio MCP server with five read-only tools — `search`, `show`,
-`related`, `who_touched` and `commands` — over the same retrieval the CLI uses. The point
-is the session you are in the middle of: last March's fix for this exact stack trace is
-already in the archive, and now the agent can find it without being told it exists. Give
-it a path and it can read the conversations that wrote the file it is about to change.
+That registers a stdio MCP server with six read-only tools — `search`, `show`,
+`related`, `who_touched`, `blame` and `commands` — over the same retrieval the CLI uses.
+The point is the session you are in the middle of: last March's fix for this exact stack
+trace is already in the archive, and now the agent can find it without being told it
+exists. Give it a path and it can read the conversations that wrote the file it is about
+to change; give it a line and it gets the commit and the conversation behind it.
 
 `llma mcp` is meant to be spawned by the client, not run by hand; it speaks JSON-RPC on
 stdin and stdout and opens no socket. Add `--data-dir` if your archive is not in the
@@ -241,6 +251,6 @@ same judgement applies as to pasting a transcript into a chat.
 
 ```bash
 uv pip install -e ".[web,embed,dev]"
-pytest        # 613 tests, all offline — every fixture is inline
+pytest        # 814 tests, all offline — every fixture is inline; blame builds a git repo in tmp
 ruff check .
 ```

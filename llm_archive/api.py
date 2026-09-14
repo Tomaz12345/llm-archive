@@ -22,6 +22,7 @@ one that was cut, which is the difference between "this session did not solve it
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -452,3 +453,196 @@ def session_commands(con: sqlite3.Connection, session_id: int,
         GROUP BY argv0 ORDER BY runs DESC LIMIT ?""", (session_id, limit)).fetchall()
     return [{"program": r["argv0"], "runs": r["runs"], "last_at": iso(r["last_at"])}
             for r in rows]
+
+
+# --- git blame bridge --------------------------------------------------------
+#
+# line -> commit -> the sessions in the commit's window. `core/gitblame.py` supplies the
+# commits and each one's window; this is the join. Two kinds of evidence, kept apart in
+# the payload because they mean different things: a session that *edited the file*
+# inside the window is the one that wrote the code, and a session that *ran the git
+# commit* is the one that decided it was done. Usually the same session; not always.
+
+# How far a transcript's clock may sit from git's. Same machine almost always, but a
+# session over SSH is timestamped by the local client while the commit is stamped by the
+# remote, and the two are not synchronised to the second.
+BLAME_SLACK_MS = 5 * 60 * 1000
+
+# `git add -A && git commit -m ...` is one `command` row whose subcommand is `add`, so
+# the commit is found in the text rather than by column: `git` at the head of a shell
+# segment, allowed its own options (`-c k=v`, `-C dir`), then `commit`. Anchoring on
+# the segment is what keeps a docstring that *mentions* `git commit` inside a heredoc
+# from counting as one.
+_GIT_COMMIT = re.compile(
+    r"(?:^|[;&|(]|\n)\s*(?:\w+=\S*\s+)*(?:sudo\s+)?git\s+"
+    r"(?:(?:-[a-zA-Z]\S*|--\S+)\s+(?:[^-\s]\S*\s+)?)*commit\b")
+_COMMIT_MSG_FLAG = re.compile(r"(?:^|\s)(?:-m|--message)(?:\s|=)")
+
+
+def _blame_file_match(bl) -> tuple[str, list]:
+    """Rows for this file: this checkout's absolute path, the repo-relative path from
+    any root or machine, and any earlier name a blamed commit knew it by."""
+    from .core import toolinput
+
+    names = {bl.rel.casefold()}
+    names.update(c.filename.casefold() for c in bl.commits.values() if c.filename)
+    clauses, params = [], []
+    absolute = toolinput.normalise_path(str(bl.repo / bl.rel))
+    if absolute is not None:
+        clauses.append("tf.norm = ?")
+        params.append(absolute.norm)
+    for name in sorted(names):
+        clauses += ["tf.rel = ?", "tf.norm = ?", "tf.norm LIKE ?"]
+        params += [name, name, f"%/{name}"]
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def _inside(cwd: str | None, repo_norm: str | None) -> bool:
+    from .core import toolinput
+
+    if not cwd or not repo_norm:
+        return False
+    here = toolinput.normalise_path(cwd)
+    return here is not None and (here.norm == repo_norm
+                                 or here.norm.startswith(repo_norm + "/"))
+
+
+def _is_the_commit(commit, text: str, cwd: str | None, repo_norm: str | None) -> bool:
+    """Whether one `git commit` command line made `commit`.
+
+    Its subject in the text settles it either way: present means yes, and a different
+    `-m` message means no even if the times line up. Only a command that carries no
+    message at all — `-F`, `--amend --no-edit`, an editor — falls back to "run from
+    inside this checkout at the right time".
+    """
+    if commit.summary and commit.summary in text:
+        return True
+    if _COMMIT_MSG_FLAG.search(text):
+        return False
+    return _inside(cwd, repo_norm)
+
+
+def _blame_hit(path: str | None = None) -> dict:
+    return {"evidence": [], "edits": 0, "first_edit_at": None, "last_edit_at": None,
+            "committed_at": None, "path": path}
+
+
+def blame_payload(con: sqlite3.Connection, path: str, *, start: int | None = None,
+                  end: int | None = None, cwd: str | None = None, limit: int = 20,
+                  filters=None) -> dict:
+    """Which sessions produced each commit behind a range of lines.
+
+    Raises `gitblame.GitError` when git cannot answer — no repository, an untracked
+    file, git not installed — since the archive cannot say anything about lines it
+    cannot attribute to a commit first.
+    """
+    from .core import gitblame, toolinput
+
+    target = Path(path)
+    if not target.is_absolute() and cwd:
+        target = Path(cwd) / target
+    bl = gitblame.blame(target, start, end)
+    repo_np = toolinput.normalise_path(str(bl.repo))
+    repo_norm = repo_np.norm if repo_np else None
+
+    # Windows in ms, per commit: (previous commit touching the file, this commit].
+    # Uncommitted lines are the working tree's: everything since the newest commit.
+    windows: dict[str, tuple[int, int | None]] = {}
+    for sha, commit in bl.commits.items():
+        prev = bl.previous.get(sha)
+        low = prev.opened_at * 1000 if prev else 0
+        high = None if commit.uncommitted else commit.closed_at * 1000 + BLAME_SLACK_MS
+        windows[sha] = (low, high)
+
+    match, params = _blame_file_match(bl)
+    extra = [match, f"tf.action IN ({','.join('?' * len(WRITE_ACTIONS))})",
+             "COALESCE(tf.ok, 1) = 1"]         # an Edit that errored changed nothing
+    where, params = _where(filters, extra, params + list(WRITE_ACTIONS))
+    edits = con.execute(f"""
+        SELECT tf.session_id, tf.at, tf.action, tf.path
+        {_FACT_FROM} {where} ORDER BY tf.at""", params).fetchall()
+
+    committed = [c for c in bl.commits.values() if not c.uncommitted]
+    commits_run: list = []
+    if committed:
+        span = [min(c.opened_at for c in committed) * 1000 - BLAME_SLACK_MS,
+                max(c.closed_at for c in committed) * 1000 + BLAME_SLACK_MS]
+        where, cparams = _where(filters, ["instr(c.text, 'commit') > 0",
+                                          "c.at >= ?", "c.at <= ?"], span)
+        commits_run = [r for r in con.execute(f"""
+            SELECT c.session_id, c.at, c.text, c.cwd {_CMD_FROM} {where}""", cparams)
+                       if _GIT_COMMIT.search(r["text"] or "")]
+
+    briefs: dict[int, dict] = {}
+
+    def brief(session_id: int) -> dict:
+        if session_id not in briefs:
+            row = session_row(con, session_id)
+            briefs[session_id] = (session_brief(row) if row is not None
+                                  else {"session_id": session_id})
+        return briefs[session_id]
+
+    order = bl.in_order()
+    out = []
+    for sha in order[:limit]:
+        commit = bl.commits[sha]
+        low, high = windows[sha]
+        prev = bl.previous.get(sha)
+        found: dict[int, dict] = {}
+
+        for row in edits:
+            if row["at"] <= low or (high is not None and row["at"] > high):
+                continue
+            hit = found.setdefault(row["session_id"], _blame_hit(row["path"]))
+            if "edit" not in hit["evidence"]:
+                hit["evidence"].append("edit")
+            hit["edits"] += 1
+            hit["first_edit_at"] = hit["first_edit_at"] or iso(row["at"])
+            hit["last_edit_at"] = iso(row["at"])
+
+        if not commit.uncommitted:
+            lo = commit.opened_at * 1000 - BLAME_SLACK_MS
+            for row in commits_run:
+                if not (lo <= row["at"] <= high):
+                    continue
+                if not _is_the_commit(commit, row["text"] or "", row["cwd"], repo_norm):
+                    continue
+                hit = found.setdefault(row["session_id"], _blame_hit())
+                if "commit" not in hit["evidence"]:
+                    hit["evidence"].insert(0, "commit")
+                hit["committed_at"] = hit["committed_at"] or iso(row["at"])
+
+        sessions = [{**brief(sid), **hit} for sid, hit in found.items()]
+        sessions.sort(key=lambda s: ("commit" not in s["evidence"], -s["edits"],
+                                     s["last_edit_at"] or ""))
+        ranges = bl.ranges(sha)
+        out.append({
+            "sha": None if commit.uncommitted else sha,
+            "short": None if commit.uncommitted else sha[:7],
+            "uncommitted": commit.uncommitted,
+            "author": None if commit.uncommitted else commit.author,
+            "summary": "not committed yet" if commit.uncommitted else commit.summary,
+            "authored_at": None if commit.uncommitted else iso(commit.author_time * 1000),
+            "committed_at": (None if commit.uncommitted
+                             else iso(commit.committer_time * 1000)),
+            "filename": commit.filename,
+            "lines": [list(r) for r in ranges],
+            "line_count": sum(b - a + 1 for a, b in ranges),
+            "previous": ({"sha": prev.sha, "short": prev.sha[:7],
+                          "committed_at": iso(prev.closed_at * 1000)}
+                         if prev else None),
+            "window": {"from": iso(low) if low else None, "to": iso(high)},
+            "session_count": len(sessions),
+            "sessions": sessions,
+        })
+
+    return {
+        "path": path,
+        "repo": str(bl.repo),
+        "file": bl.rel,
+        "range": {"start": bl.start, "end": bl.end},
+        "lines": len(bl.lines),
+        "count": len(out),
+        "total": len(order),
+        "commits": out,
+    }

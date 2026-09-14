@@ -1,8 +1,9 @@
-"""A stdio MCP server over the archive: `search`, `show`, `related`. Read-only.
+"""A stdio MCP server over the archive: `search`, `show`, `related`, `who_touched`,
+`blame`, `commands`. Read-only.
 
 The archive answers "have I solved this before?" — but until now only to whoever was
 willing to open a browser tab and read. The agent already sitting in the terminal, about
-to re-derive last March's fix from scratch, had no way in. This is that way in: three
+to re-derive last March's fix from scratch, had no way in. This is that way in: six
 tools over `api.py`, so an assistant can consult the archive mid-session.
 
 **Read-only, and offline by construction.** Every tool is a SELECT. Nothing here ingests,
@@ -211,6 +212,54 @@ TOOLS = [
         "annotations": _READ_ONLY,
     },
     {
+        "name": "blame",
+        "title": "Conversations behind a range of lines",
+        "description":
+            "From a line of code to the conversation that wrote it. Runs git blame on "
+            "a file in a checkout on this machine, then for each commit behind the "
+            "requested lines finds the past sessions that edited that file in the "
+            "commit's window — from the previous commit that touched the file up to "
+            "this one — and the session that ran the git commit itself. Use it when "
+            "you are about to change lines and want to know why they are the way they "
+            "are: the commit message is one line, the session is the reasoning. Lines "
+            "not yet committed are reported too, attributed to whatever edited the "
+            "file since its newest commit. Two kinds of evidence are kept apart in "
+            "`evidence`: \"edit\" (wrote the file in the window) and \"commit\" (ran "
+            "the commit). Needs git and a checkout on this machine; for a path with "
+            "no repository, or a file that only exists on another machine, use "
+            "`who_touched` instead. Follow up with `show` and include_tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file, absolute or relative to `cwd`. A line "
+                                   "suffix is accepted: src/db.py:137 or "
+                                   "src/db.py:120-140.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Directory a relative `path` is resolved against. "
+                                   "Defaults to the server's working directory, which "
+                                   "is normally the project the client was started in.",
+                },
+                "line_start": {"type": "integer", "minimum": 1,
+                               "description": "First line of the range (1-based)."},
+                "line_end": {"type": "integer", "minimum": 1,
+                             "description": "Last line, inclusive. Defaults to "
+                                            "line_start. Omit both for the whole file."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "default": 20,
+                          "description": "Commits to report, in the order they appear "
+                                         "in the range."},
+                **_FILTERS,
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
         "name": "commands",
         "title": "Shell commands run in past sessions",
         "description":
@@ -392,8 +441,34 @@ def _tool_commands(archive: Archive, args: dict) -> dict:
         filters=_filters(args))
 
 
+def _tool_blame(archive: Archive, args: dict) -> dict:
+    from ..core import gitblame
+
+    con, _ = archive.open()
+    target = args.get("path")
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError("path must be a non-empty string")
+    path, start, end = gitblame.split_line_suffix(target.strip())
+    if args.get("line_start") is not None:
+        start = _bounded(args.get("line_start"), 1, 1, 10_000_000)
+        end = _bounded(args.get("line_end"), start, start, 10_000_000)
+    elif args.get("line_end") is not None:
+        raise ValueError("line_end needs a line_start")
+    cwd = args.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        raise ValueError("cwd must be a string")
+    # GitError is a RuntimeError: it reaches the caller as an isError result carrying
+    # git's own message, which is what an agent needs to decide to fall back to
+    # `who_touched`.
+    return api.blame_payload(
+        con, path, start=start, end=end, cwd=cwd or None,
+        limit=_bounded(args.get("limit"), 20, 1, 100),
+        filters=_filters(args))
+
+
 HANDLERS = {"search": _tool_search, "show": _tool_show, "related": _tool_related,
-            "who_touched": _tool_who_touched, "commands": _tool_commands}
+            "who_touched": _tool_who_touched, "blame": _tool_blame,
+            "commands": _tool_commands}
 
 
 # --------------------------------------------------------------- protocol ----

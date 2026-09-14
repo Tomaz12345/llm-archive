@@ -1022,6 +1022,97 @@ def commands_cmd(
             typer.echo("    …")
 
 
+@app.command("blame")
+def blame_cmd(
+    target: str = typer.Argument(..., help="a file in a git checkout; may carry a "
+                                           "line suffix: api.py:137 or api.py:120-140"),
+    lines: str = typer.Option(None, "--lines", "-L",
+                              help="line range, git style: 120,140 or a single line"),
+    limit: int = typer.Option(20, "--limit", "-n", help="commits to report"),
+    source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
+    workspace: str = typer.Option(None, "--workspace", "-w"),
+    host: str = typer.Option(None, "--host"),
+    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
+    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    abandoned: bool = typer.Option(False, "--abandoned",
+                                   help="include abandoned branches"),
+    json_out: bool = typer.Option(False, "--json"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """From a line of code to the conversation that wrote it.
+
+        llma blame llm_archive/api.py:137          # one line
+        llma blame llm_archive/api.py -L 120,140   # a range
+        llma blame llm_archive/api.py              # the whole file, by commit
+
+    git blame gets from the line to a commit; this carries on to the sessions that
+    edited the file in that commit's window and the one that ran the commit.
+    """
+    from . import api
+    from .core import gitblame
+    from .search.hybrid import Filters
+
+    path, start, end = gitblame.split_line_suffix(target)
+    if lines:
+        try:
+            start, end = gitblame.parse_range(lines)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2)
+
+    con, _, _ = _open(data_dir)
+    filters = Filters(sources=tuple(source or ()), workspace=workspace, host=host,
+                      since=api.parse_day(since), until=api.parse_day(until),
+                      include_abandoned=abandoned)
+    try:
+        payload = api.blame_payload(con, path, start=start, end=end, limit=limit,
+                                    filters=filters)
+    except gitblame.GitError as exc:
+        typer.echo(f"blame: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if json_out:
+        _echo_json(payload)
+        return
+
+    span = payload["range"]
+    where = (f"{payload['file']}:{span['start']}" if span["start"] == span["end"]
+             else f"{payload['file']}:{span['start']}-{span['end']}")
+    n, nl = payload["total"], payload["lines"]
+    typer.echo(f"{where}   {n} commit{'s' if n != 1 else ''}, "
+               f"{nl} line{'s' if nl != 1 else ''}"
+               + (f"   (showing {payload['count']})" if payload["count"] < n else ""))
+
+    cited = None
+    for commit in payload["commits"]:
+        runs = ", ".join(f"{a}" if a == b else f"{a}-{b}" for a, b in commit["lines"])
+        head = (f"{commit['short']}  {commit['committed_at'][:10]}  {commit['summary']}"
+                if not commit["uncommitted"] else "-------  not committed yet")
+        typer.echo(f"\n{head}   (lines {runs})")
+        if not commit["sessions"]:
+            if _facts_ready(con):
+                since_ = (f"since {commit['previous']['short']}"
+                          if commit["previous"] else "before this commit")
+                typer.echo(f"    no session in the archive edited this file {since_}")
+            else:
+                typer.echo("    no file history yet - run `llma index`")
+            continue
+        for i, hit in enumerate(commit["sessions"], start=1):
+            cited = cited or hit["session_id"]
+            did = []
+            if "commit" in hit["evidence"]:
+                did.append("ran the commit")
+            if hit["edits"]:
+                did.append(f"{hit['edits']} edit" + ("s" if hit["edits"] != 1 else ""))
+            when = hit.get("last_edit_at") or hit.get("committed_at") or ""
+            place = " · ".join(x for x in (when[:10] or None, hit.get("source"),
+                                           hit.get("workspace"), hit.get("host")) if x)
+            typer.echo(f"   {i:>2}. {hit.get('title') or '(untitled)'}")
+            typer.echo(f"       {place}   {', '.join(did)}   [#{hit['session_id']}]")
+    if cited:
+        typer.echo(f"\nread one with: llma show {cited} --tools")
+
+
 @app.command()
 def lineage(
     json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
