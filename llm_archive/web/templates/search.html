@@ -59,8 +59,14 @@
           <span>{{ item.when }}</span>
           {% if h.workspace %}<span>· <a href="/workspace/{{ h.workspace|urlencode }}" title="everything this project touched">{{ h.workspace }}</a></span>{% endif %}
           {% if h.host %}<span>· {{ h.host }}</span>{% endif %}
-          <span class="match match-{{ h.matched_by }}" title="which retriever found it">
-            {{ h.matched_by }}
+          {# Each retriever's own rank before fusion. Fusion is weighted, so this is
+             what explains a result that sits higher or lower than it looks like it
+             should. #}
+          <span class="match match-{{ h.matched_by }}"
+                title="where each retriever ranked it before the two were fused">
+            {%- if h.keyword_rank %}keyword #{{ h.keyword_rank }}{% endif -%}
+            {%- if h.keyword_rank and h.semantic_rank %} · {% endif -%}
+            {%- if h.semantic_rank %}semantic #{{ h.semantic_rank }}{% endif -%}
           </span>
           {% for t in item.tags %}<span class="tag">{{ t }}</span>{% endfor %}
         </div>

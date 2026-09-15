@@ -94,6 +94,35 @@
   </div>
   {% endif %}
 
+  {# Part-level, unlike the groups above: which part of a conversation the words must
+     be in. "What I typed" is the sharpest filter here -- your own phrasing of a
+     problem, a tenth of the archive. #}
+  <div class="fgroup">
+    <h3>Match in</h3>
+    <select name="role" title="Tool output filed under a role is left out unless a kind below asks for it.">
+      <option value="">anyone's words</option>
+      <option value="user" {% if role == "user" %}selected{% endif %}>what I typed</option>
+      <option value="assistant" {% if role == "assistant" %}selected{% endif %}>what the model said</option>
+    </select>
+    <select name="kind" title="tool output is indexed for keyword search but never embedded, so it only answers to exact words">
+      <option value="">any kind of part</option>
+      {% for k, label in [('text','text'), ('thinking','thinking'),
+                          ('tool_use','tool calls'), ('tool_result','tool output')] %}
+        <option value="{{ k }}" {% if k == kind %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    {% if facets.tools %}
+    <select name="tool" title="sessions in which this tool was called at all">
+      <option value="">any tool, or none</option>
+      {% for t in facets.tools %}
+        <option value="{{ t.name }}" {% if t.name == tool %}selected{% endif %}>
+          ran {{ t.name }} ({{ t.n }})
+        </option>
+      {% endfor %}
+    </select>
+    {% endif %}
+  </div>
+
   <div class="fgroup">
     <h3>Date</h3>
     <label class="date">from <input type="date" name="since" value="{{ since }}"></label>

@@ -133,6 +133,9 @@ def _hit(hit: Hit, snippet_chars: int,
         "started_at": iso(hit.started_at),
         "score": hit.score,
         "matched_by": hit.matched_by,
+        # each retriever's own position for this session before fusion, or null where
+        # that retriever did not return it — the thing to read when a ranking surprises
+        "ranks": {"keyword": hit.keyword_rank, "semantic": hit.semantic_rank},
         "snippets": [{"part_id": s.part_id, "kind": s.kind, "role": s.role,
                       **_text(s.text, snippet_chars)}
                      for s in hit.snippets],

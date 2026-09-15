@@ -90,6 +90,34 @@ _FILTERS = {
     },
 }
 
+# Filters that only mean something to a text search: the other tools read tool-call
+# facts, where every part is a tool_use and a role or kind would be noise in the schema.
+_SEARCH_FILTERS = {
+    **_FILTERS,
+    "role": {
+        "type": "string", "enum": ["user", "assistant", "tool", "system"],
+        "description": "Only what this role said. `user` searches the person's own "
+                       "prompts -- the best index of what a session was really about, "
+                       "and a tenth of the corpus. Tool output filed under a role is "
+                       "left out unless `kind` names it.",
+    },
+    "kind": {
+        "type": "string",
+        "enum": ["text", "thinking", "tool_use", "tool_result", "image", "attachment"],
+        "description": "Only parts of this kind. `tool_result` finds the session that "
+                       "HIT an error or saw a given output, rather than one that "
+                       "discussed it; keyword-only by nature, as tool output is "
+                       "never embedded. `tool_use` finds the session that ran a "
+                       "given command.",
+    },
+    "tool": {
+        "type": "string",
+        "description": "Only sessions in which this tool was called at all, e.g. "
+                       "Bash, Edit, WebFetch. Case-insensitive. Combine with "
+                       "kind=tool_result to search what that tool returned.",
+    },
+}
+
 _READ_ONLY = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}
 
 TOOLS = [
@@ -127,7 +155,7 @@ TOOLS = [
                                    "is also the only way to reach tool output, as that "
                                    "is indexed but never embedded.",
                 },
-                **_FILTERS,
+                **_SEARCH_FILTERS,
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -309,7 +337,7 @@ TOOLS = [
                 "session_id": {"type": "integer",
                                "description": "The session to find neighbours for."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                **_FILTERS,
+                **_SEARCH_FILTERS,
             },
             "required": ["session_id"],
             "additionalProperties": False,
@@ -374,6 +402,9 @@ def _filters(args: dict) -> Filters:
                    workspace=args.get("workspace"),
                    host=args.get("host"),
                    topic=args.get("topic"),
+                   role=args.get("role"),
+                   kind=args.get("kind"),
+                   tool=args.get("tool"),
                    since=api.parse_day(args.get("since")),
                    until=api.parse_day(args.get("until")),
                    include_abandoned=bool(args.get("include_abandoned")))

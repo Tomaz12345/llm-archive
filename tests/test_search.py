@@ -124,6 +124,32 @@ def test_filters_build_params_in_order():
     assert where.count("?") == 4
 
 
+def test_filters_reject_a_role_or_kind_they_do_not_know():
+    """A typo must be an error, not a clean 'no matches'."""
+    with pytest.raises(ValueError, match="kind must be one of"):
+        Filters(kind="tool_results")
+    with pytest.raises(ValueError, match="role must be one of"):
+        Filters(role="me")
+
+
+def test_a_role_alone_means_what_that_role_said():
+    """Claude Code files tool_result under 'user'; a bare role must not sweep it in."""
+    where, params = Filters(role="user").sql()
+    assert "m.role = ?" in where and "p.kind IN (" in where
+    assert "tool_result" not in params and "text" in params
+
+    # naming a kind lifts that: this is exactly the tool output filed under 'user'
+    where, params = Filters(role="user", kind="tool_result").sql()
+    assert "p.kind = ?" in where and "p.kind IN (" not in where
+    assert params[:2] == ("user", "tool_result")
+
+
+def test_tool_filter_is_session_level_and_case_insensitive():
+    where, params = Filters(tool="bash").sql()
+    assert "s.id IN (SELECT" in where and "tool_name = ? COLLATE NOCASE" in where
+    assert params == ("bash",)
+
+
 # --------------------------------------------------------- integration ----
 
 def build_archive(tmp_path: Path):
@@ -239,6 +265,93 @@ def test_weights_change_the_ranking(tmp_path):
                    weights=(0.0, 1.6))
     assert normal and all(h.score > 0 for h in normal)
     assert muted == [] or all(h.score == 0 for h in muted)
+
+
+# ------------------------------------------------ role / kind / tool filters ----
+#
+# Its own fixture: these need tool traffic, and the archive above is text only.
+
+def archive_with_tool_traffic(tmp_path: Path):
+    con = db.connect(tmp_path / "t.db")
+    src = db.source_id(con, "claude_code", "Claude Code", "cli")
+
+    def add(native, title, parts):
+        msgs = []
+        for i, (role, kind, text, tool) in enumerate(parts):
+            m = Message(native_id=f"{native}-{i}", role=role, seq=i,
+                        created_at=1771200000000 + i)
+            m.parts.append(Part(kind=kind, seq=0, text=text, tool_name=tool,
+                                embed_eligible=kind == "text"))
+            msgs.append(m)
+        db.upsert_session(con, src, Session(
+            source_kind="claude_code", native_id=native, title=title,
+            workspace_key="proj", workspace_label="proj", host="box",
+            started_at=1771200000000, raw_path="x", raw_hash=native, messages=msgs))
+
+    # hit the error: the trace is tool output, filed under 'user' as Claude Code does
+    add("t1", "Nightly batch crashed", [
+        ("user", "text", "why does the nightly batch job crash", None),
+        ("assistant", "text", "let me run it and read the traceback", None),
+        ("assistant", "tool_use", "python batch.py", "Bash"),
+        ("user", "tool_result",
+         "Traceback (most recent call last): ModuleNotFoundError: "
+         "No module named psycopg2", None),
+    ])
+    # discussed the error, never hit it, ran nothing
+    add("t2", "Installing psycopg2", [
+        ("user", "text", "how do I install psycopg2 so ModuleNotFoundError goes away",
+         None),
+        ("assistant", "text", "pip install psycopg2-binary", None),
+    ])
+    # ran a different tool
+    add("t3", "Config loader tidy-up", [
+        ("user", "text", "tidy the config loader", None),
+        ("assistant", "tool_use", "file_path: loader.py", "Edit"),
+    ])
+    con.commit()
+    fts.rebuild(con)
+    return con
+
+
+def test_kind_finds_the_session_that_hit_the_error_not_the_one_that_discussed_it(tmp_path):
+    con = archive_with_tool_traffic(tmp_path)
+    both = search(con, tmp_path / "vectors", "ModuleNotFoundError psycopg2",
+                  mode="keyword")
+    assert {h.title for h in both} == {"Nightly batch crashed", "Installing psycopg2"}
+
+    hit = search(con, tmp_path / "vectors", "ModuleNotFoundError psycopg2",
+                 mode="keyword", filters=Filters(kind="tool_result"))
+    assert [h.title for h in hit] == ["Nightly batch crashed"]
+    assert hit[0].snippets[0].kind == "tool_result"
+
+
+def test_role_user_is_what_was_typed_not_what_a_tool_returned(tmp_path):
+    con = archive_with_tool_traffic(tmp_path)
+    typed = search(con, tmp_path / "vectors", "ModuleNotFoundError", mode="keyword",
+                   filters=Filters(role="user"))
+    assert [h.title for h in typed] == ["Installing psycopg2"]
+
+    # asking for the kind explicitly reaches the tool output filed under that role
+    returned = search(con, tmp_path / "vectors", "ModuleNotFoundError", mode="keyword",
+                      filters=Filters(role="user", kind="tool_result"))
+    assert [h.title for h in returned] == ["Nightly batch crashed"]
+
+
+def test_tool_narrows_to_sessions_that_called_it(tmp_path):
+    con = archive_with_tool_traffic(tmp_path)
+    ran = search(con, tmp_path / "vectors", "psycopg2", mode="keyword",
+                 filters=Filters(tool="bash"))
+    assert [h.title for h in ran] == ["Nightly batch crashed"]
+    assert search(con, tmp_path / "vectors", "psycopg2", mode="keyword",
+                  filters=Filters(tool="Edit")) == []
+
+
+def test_hits_carry_each_retriever_rank(tmp_path):
+    """Keyword-only archive: a keyword rank on every hit, no semantic rank."""
+    con = archive_with_tool_traffic(tmp_path)
+    hits = search(con, tmp_path / "vectors", "ModuleNotFoundError psycopg2")
+    assert [h.keyword_rank for h in hits] == [1, 2]
+    assert all(h.semantic_rank is None for h in hits)
 
 
 def test_search_filters_by_participant(tmp_path):
@@ -488,6 +601,7 @@ def test_hybrid_related_uses_both_halves(tmp_path):
     hits = related(con, tmp_path / "vectors", 4)
     assert hits[0].session_id == 5
     assert hits[0].matched_by == "both"
+    assert (hits[0].keyword_rank, hits[0].semantic_rank) == (1, 1)
 
 
 # --- derived tool facts -------------------------------------------------------

@@ -158,6 +158,7 @@ def test_search_payload_carries_hits_and_bounded_snippets(con, data_dir):
     hit = payload["results"][0]
     assert hit["started_at"] == "2026-02-16T00:00:00Z"
     assert hit["matched_by"] == "keyword"
+    assert hit["ranks"] == {"keyword": 1, "semantic": None}
     assert all(len(s["text"]) <= 40 for s in hit["snippets"])
     assert any(s["truncated"] for s in hit["snippets"])
 
@@ -320,6 +321,31 @@ def test_search_tool_applies_filters(archive):
     payload, _ = call(archive, "search", query="deadlock", mode="keyword",
                       source=["chatgpt"])
     assert payload["results"] == []
+
+
+def test_search_tool_filters_by_role_kind_and_tool(archive):
+    # the pg_locks output is tool_result, filed under 'user' the way Claude Code does
+    payload, _ = call(archive, "search", query="transactionid", mode="keyword",
+                      kind="tool_result")
+    assert [r["title"] for r in payload["results"]] == \
+        ["Postgres advisory locks in the batch job"]
+    assert payload["results"][0]["snippets"][0]["kind"] == "tool_result"
+
+    # role alone is what the person typed: the command and its output stay out
+    payload, _ = call(archive, "search", query="pg_locks transactionid",
+                      mode="keyword", role="user")
+    assert payload["results"] == []
+
+    # only s1 ran anything; s2 discussed the same deadlock without a tool call
+    payload, _ = call(archive, "search", query="deadlock", mode="keyword",
+                      tool="bash")
+    assert [r["title"] for r in payload["results"]] == \
+        ["Postgres advisory locks in the batch job"]
+
+
+def test_search_tool_rejects_an_unknown_kind_with_a_readable_error(archive):
+    body, failed = call(archive, "search", query="deadlock", kind="tool_results")
+    assert failed and "kind must be one of" in body
 
 
 def test_search_tool_accepts_a_bare_source_string(archive):

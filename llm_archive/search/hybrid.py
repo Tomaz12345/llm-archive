@@ -31,6 +31,10 @@ from pathlib import Path
 
 import numpy as np
 
+from ..core.models import (
+    KIND_ATTACHMENT, KIND_IMAGE, KIND_TEXT, KIND_THINKING, KIND_TOOL_RESULT,
+    KIND_TOOL_USE, TURN_KINDS,
+)
 from . import fts
 from .chunker import strip_header
 from .embed import DEFAULT_MODEL, MODEL_TAG, VectorStore, get_embedder
@@ -61,6 +65,12 @@ CANDIDATES = 80                  # per retriever, before fusion
 # represented by its end as well as its opening.
 CENTROID_CHUNKS = 120
 
+# What `Filters.role` and `Filters.kind` accept. Checked when the filter is built rather
+# than left to the query: a typo would otherwise come back as a clean "no matches".
+ROLES = ("user", "assistant", "tool", "system")
+KINDS = (KIND_TEXT, KIND_THINKING, KIND_TOOL_USE, KIND_TOOL_RESULT, KIND_IMAGE,
+         KIND_ATTACHMENT)
+
 
 @dataclass
 class Snippet:
@@ -80,6 +90,11 @@ class Hit:
     host: str | None
     started_at: int | None
     matched_by: str                      # keyword | semantic | both
+    # Where the session stood in each retriever's own list before fusion (1 = top);
+    # None where that retriever did not return it at all. Fusion is weighted, so a
+    # final position can look wrong — these say which half put it there.
+    keyword_rank: int | None = None
+    semantic_rank: int | None = None
     snippets: list[Snippet] = field(default_factory=list)
 
 
@@ -95,6 +110,22 @@ class Filters:
     # post-filter on the hit list: filtering after fusion would silently shrink an
     # already-truncated result set, so a narrow topic would come back looking empty.
     topic: str | None = None
+    # Part-level, unlike everything above: the *matching part* must have this role or
+    # kind, so `kind='tool_result'` finds the session that hit a stack trace rather than
+    # the one that discussed it, and `role='user'` searches only what you typed — the
+    # highest-signal index of intent there is, and a tenth of the corpus.
+    #
+    # A role on its own means what that role *said*. Tool traffic carries a role too —
+    # Claude Code files every tool_result under 'user' — so without this, `role='user'`
+    # would be mostly tool output, the opposite of what it is for. Naming a `kind`
+    # lifts that: `role='user', kind='tool_result'` is exactly those results.
+    role: str | None = None
+    kind: str | None = None
+    # Session-level: sessions in which this tool was called at all, case-insensitive.
+    # Part-level would read more naturally, but `tool_name` is stamped on the call and
+    # almost never on its result, so "Bash output containing X" is `tool='Bash'` plus
+    # `kind='tool_result'`, not a tool_name on the result row.
+    tool: str | None = None
     since: int | None = None
     until: int | None = None
     include_abandoned: bool = False
@@ -102,6 +133,12 @@ class Filters:
     # being asked about: excluding it after fusion would be too late, because its own
     # parts win every retriever and would eat most of the CANDIDATES budget first.
     exclude_session: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.role and self.role not in ROLES:
+            raise ValueError(f"role must be one of {', '.join(ROLES)}; got {self.role!r}")
+        if self.kind and self.kind not in KINDS:
+            raise ValueError(f"kind must be one of {', '.join(KINDS)}; got {self.kind!r}")
 
     def sql(self) -> tuple[str, tuple]:
         clauses, params = [], []
@@ -121,6 +158,21 @@ class Filters:
             clauses.append("s.id IN (SELECT st.session_id FROM session_topic st "
                            "JOIN topic t ON t.id = st.topic_id WHERE t.slug = ?)")
             params.append(self.topic)
+        if self.role:
+            clauses.append("m.role = ?")
+            params.append(self.role)
+            if not self.kind:
+                turn = sorted(TURN_KINDS)
+                clauses.append(f"p.kind IN ({','.join('?' * len(turn))})")
+                params.extend(turn)
+        if self.kind:
+            clauses.append("p.kind = ?")
+            params.append(self.kind)
+        if self.tool:
+            clauses.append("s.id IN (SELECT m2.session_id FROM part p2 "
+                           "JOIN message m2 ON m2.id = p2.message_id "
+                           "WHERE p2.tool_name = ? COLLATE NOCASE)")
+            params.append(self.tool)
         if self.since:
             clauses.append("s.started_at >= ?")
             params.append(self.since)
@@ -239,6 +291,7 @@ def _fuse(con, keyword_parts: list[tuple[int, float]],
             host=meta["host"], started_at=meta["started_at"],
             matched_by="both" if in_kw and in_sem else
                        ("keyword" if in_kw else "semantic"),
+            keyword_rank=kw_rank.get(sid), semantic_rank=sem_rank.get(sid),
             snippets=_snippets(con, best_parts.get(sid, [])[:snippets_per_hit]),
         ))
     return hits

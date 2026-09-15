@@ -186,6 +186,13 @@ def create_app(data_dir: Path | None = None, *,
             # Derived, not typed: see search/topics.py. Empty until an index with
             # vectors has run, and the sidebar hides the group entirely when so.
             "topics": topic_facet(con),
+            # Counted per session, not per call: a tool used 6,000 times in one
+            # session is one place to look, and this is a filter on places to look.
+            "tools": con.execute("""
+                SELECT p.tool_name AS name, COUNT(DISTINCT m.session_id) n
+                FROM part p JOIN message m ON m.id = p.message_id
+                WHERE p.tool_name IS NOT NULL AND p.kind = 'tool_use'
+                GROUP BY p.tool_name ORDER BY n DESC LIMIT 40""").fetchall(),
         }
 
     def totals(con) -> dict:
@@ -251,6 +258,7 @@ def create_app(data_dir: Path | None = None, *,
              source: list[str] = Query(default=[]), participant: str = "",
              workspace: str = "", host: str = "", since: str = "", until: str = "",
              tag: str = "", model_type: str = "", topic: str = "",
+             role: str = "", kind: str = "", tool: str = "",
              abandoned: bool = False, limit: int = 25):
         from ..stats import metrics
         from ..stats.model_types import model_type_index
@@ -272,6 +280,8 @@ def create_app(data_dir: Path | None = None, *,
                                     workspace=workspace or None,
                                     host=host or None,
                                     topic=topic or None,
+                                    role=role or None, kind=kind or None,
+                                    tool=tool or None,
                                     since=_as_ms(since), until=_as_ms(until),
                                     include_abandoned=abandoned),
                     mode=mode, weights=DEFAULT_WEIGHTS)
@@ -315,6 +325,7 @@ def create_app(data_dir: Path | None = None, *,
             "workspace": workspace,
             "host": host, "since": since, "until": until, "tag": tag,
             "model_type": model_type, "topic": topic,
+            "role": role, "kind": kind, "tool": tool,
             "abandoned": abandoned, "elapsed": elapsed, "error": error,
             # a stale index misleads here more than anywhere else: these are the results
             "index": metrics.index_health(con), "fmt_when": _fmt,

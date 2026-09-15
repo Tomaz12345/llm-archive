@@ -36,6 +36,20 @@ def _echo_json(payload) -> None:
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _ranks(hit) -> str:
+    """`keyword #3 / semantic #1`: where each retriever had it before fusion.
+
+    Fusion is weighted, so the final order is not always what either half would have
+    chosen on its own; this is the note that makes a surprising position debuggable
+    rather than merely surprising. The names are the `--mode` names, so a doubtful
+    result can be re-run on one half alone.
+    """
+    halves = [f"{name} #{rank}" for name, rank in (("keyword", hit.keyword_rank),
+                                                   ("semantic", hit.semantic_rank))
+              if rank is not None]
+    return " / ".join(halves) or hit.matched_by
+
+
 def _echo_hits(hits) -> None:
     """The ranked list `search` and `related` both print."""
     for i, hit in enumerate(hits, 1):
@@ -45,7 +59,7 @@ def _echo_hits(hits) -> None:
         machine = f" · {hit.host}" if hit.host else ""
         typer.echo(f"\n{i:>2}. {hit.title or '(untitled)'}")
         typer.echo(f"    {when} · {hit.source}{where}{machine}"
-                   f" · {hit.matched_by} · {hit.score:.4f}  [#{hit.session_id}]")
+                   f" · {_ranks(hit)} · {hit.score:.4f}  [#{hit.session_id}]")
         for snip in hit.snippets[:2]:
             text = " ".join((snip.text or "").split())
             if text:
@@ -424,6 +438,26 @@ def index_cmd(
         typer.echo(f"  ! {warning}")
 
 
+ROLE_HELP = ("only what this role said: user, assistant (tool output filed under a "
+             "role is left out unless --kind asks for it)")
+KIND_HELP = ("only parts of this kind: text, thinking, tool_use, tool_result — "
+             "tool_result finds the session that hit an error, not one that discussed it")
+TOOL_HELP = "only sessions that called this tool, e.g. Bash, Edit (case-insensitive)"
+
+
+def _search_filters(**values):
+    """`Filters(**values)`, with a bad role or kind reported as a usage error.
+
+    The dataclass raises ValueError on a value it does not know; left alone that is a
+    traceback for a typo, which is not what `--kind tool_results` deserves.
+    """
+    from .search.hybrid import Filters
+    try:
+        return Filters(**values)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+
 @app.command("search")
 def search_cmd(
     query: str = typer.Argument(..., help="what you are looking for"),
@@ -436,6 +470,9 @@ def search_cmd(
     host: str = typer.Option(None, "--host"),
     topic: str = typer.Option(None, "--topic",
                               help="a derived topic group's slug (see: llma topics)"),
+    role: str = typer.Option(None, "--role", help=ROLE_HELP),
+    kind: str = typer.Option(None, "--kind", help=KIND_HELP),
+    tool: str = typer.Option(None, "--tool", help=TOOL_HELP),
     since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
     until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
     mode: str = typer.Option("hybrid", "--mode",
@@ -448,16 +485,16 @@ def search_cmd(
 ) -> None:
     """Search the archive."""
     from . import api
-    from .search.hybrid import Filters
     from .search.hybrid import search as run_search
 
     con, _, db_path = _open(data_dir)
     vectors_dir = (data_dir or db_path.parent) / "vectors"
 
-    filters = Filters(sources=tuple(source or ()), participant=participant,
-                      workspace=workspace, host=host, topic=topic,
-                      since=api.parse_day(since), until=api.parse_day(until),
-                      include_abandoned=abandoned)
+    filters = _search_filters(sources=tuple(source or ()), participant=participant,
+                              workspace=workspace, host=host, topic=topic,
+                              role=role, kind=kind, tool=tool,
+                              since=api.parse_day(since), until=api.parse_day(until),
+                              include_abandoned=abandoned)
 
     if json_out:
         _echo_json(api.search_payload(con, vectors_dir, query, limit=limit,
@@ -481,6 +518,9 @@ def related(
     host: str = typer.Option(None, "--host"),
     topic: str = typer.Option(None, "--topic",
                               help="a derived topic group's slug (see: llma topics)"),
+    role: str = typer.Option(None, "--role", help=ROLE_HELP),
+    kind: str = typer.Option(None, "--kind", help=KIND_HELP),
+    tool: str = typer.Option(None, "--tool", help=TOOL_HELP),
     since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
     until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
     abandoned: bool = typer.Option(False, "--abandoned",
@@ -496,15 +536,15 @@ def related(
     months apart.
     """
     from . import api
-    from .search.hybrid import Filters
     from .search.hybrid import related as run_related
 
     con, _, db_path = _open(data_dir)
     vectors_dir = (data_dir or db_path.parent) / "vectors"
-    filters = Filters(sources=tuple(source or ()), participant=participant,
-                      workspace=workspace, host=host, topic=topic,
-                      since=api.parse_day(since), until=api.parse_day(until),
-                      include_abandoned=abandoned)
+    filters = _search_filters(sources=tuple(source or ()), participant=participant,
+                              workspace=workspace, host=host, topic=topic,
+                              role=role, kind=kind, tool=tool,
+                              since=api.parse_day(since), until=api.parse_day(until),
+                              include_abandoned=abandoned)
 
     if json_out:
         payload = api.related_payload(con, vectors_dir, session_id,

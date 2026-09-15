@@ -293,6 +293,19 @@ def test_search_filters_by_participant(client):
     assert "Offside detection work" not in r.text
 
 
+def test_search_filters_by_kind_and_shows_the_retriever_rank(client):
+    r = client.get("/?q=pipeline&mode=keyword&kind=tool_result")
+    assert "Offside detection work" in r.text
+    assert "keyword #1" in r.text
+    r = client.get("/?q=pipeline&mode=keyword&kind=text")
+    assert "Offside detection work" not in r.text
+
+
+def test_search_reports_an_unknown_kind_instead_of_failing(client):
+    r = client.get("/?q=offside&mode=keyword&kind=tool_results")
+    assert r.status_code == 200 and "kind must be one of" in r.text
+
+
 def test_stats_labels_model_less_rows_without_pricing_them(client):
     """A row labelled by its participant must never read as a priced model."""
     r = client.get("/stats")

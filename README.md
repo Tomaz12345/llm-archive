@@ -152,11 +152,18 @@ llma index --no-vectors           # keyword only, seconds
 llma search "postgres deadlock"
 llma search "kako naredim migracijo" --source claude_code --since 2026-01-01
 llma search "the offside thing" --mode semantic -n 20
+llma search "ModuleNotFoundError" --kind tool_result   # the session that HIT it, not one that discussed it
+llma search "retry policy" --role user                 # only what you typed: your own phrasing of the problem
+llma search "migration" --tool Bash                    # only sessions that actually ran something
 llma search "postgres deadlock" --json     # same results, for a script
 ```
 
 Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
-`--since` / `--until`, `--abandoned`.
+`--since` / `--until`, `--abandoned`, and three on the matching part itself: `--role`
+(user, assistant), `--kind` (text, thinking, tool_use, tool_result) and `--tool` (sessions
+that called a given tool). Each hit says where each retriever ranked it before fusion —
+`keyword #3 / semantic #1` — so a surprising position can be traced to the half that
+put it there, and re-run with `--mode` on that half alone.
 
 ### 3. Read, browse, export
 
