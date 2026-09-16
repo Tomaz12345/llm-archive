@@ -122,9 +122,12 @@ class Filters:
     role: str | None = None
     kind: str | None = None
     # Session-level: sessions in which this tool was called at all, case-insensitive.
-    # Part-level would read more naturally, but `tool_name` is stamped on the call and
-    # almost never on its result, so "Bash output containing X" is `tool='Bash'` plus
-    # `kind='tool_result'`, not a tool_name on the result row.
+    # Part-level ("the matching part is a Bash call or Bash output") would read more
+    # naturally, and every adapter now stamps `tool_name` on results as well as calls —
+    # but an archive ingested before Claude Code's adapter did so has names on calls
+    # only, and a part-level filter would silently miss all of its output until an
+    # `ingest --force`. So the tool narrows the sessions and `kind` narrows the part:
+    # `tool='Bash', kind='tool_result'` is "Bash output containing X" on any archive.
     tool: str | None = None
     since: int | None = None
     until: int | None = None

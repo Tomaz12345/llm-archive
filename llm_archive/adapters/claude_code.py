@@ -450,7 +450,7 @@ class ClaudeCodeAdapter:
                         embed_eligible=True)  # intent is worth embedding; the payload is not
             attach_tool_input(part, blk.get("input"), self.blobs)
             tool_id = blk.get("id")
-            if isinstance(tool_id, str) and when:
+            if isinstance(tool_id, str):
                 tool_calls[tool_id] = (when, part)
             return part
 
@@ -510,13 +510,16 @@ class ClaudeCodeAdapter:
                     bytes=blk.get("persistedOutputSize") or len(text.encode("utf-8", "replace")),
                     embed_eligible=False)   # §1.1: indexed for FTS, never embedded
 
+        # A result block names no tool -- only the call it answers, by id. Carry the
+        # call's name across: every other agent source stamps its results, and without
+        # it here a `--tool Bash` search could reach the command but never its output.
         tool_use_id = blk.get("tool_use_id")
-        if isinstance(tool_use_id, str) and when:
-            call = tool_calls.pop(tool_use_id, None)
-            if call is not None:
-                started, use_part = call
-                if when >= started:
-                    use_part.duration_ms = when - started
+        call = tool_calls.pop(tool_use_id, None) if isinstance(tool_use_id, str) else None
+        if call is not None:
+            started, use_part = call
+            part.tool_name = use_part.tool_name
+            if when and started and when >= started:
+                use_part.duration_ms = when - started
 
         match = PERSISTED.search(text)
         if match and self.blobs is not None:

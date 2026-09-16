@@ -109,6 +109,34 @@ def test_tool_result_is_indexed_but_not_embedded(tmp_path):
     assert part.text == "huge file dump"
 
 
+def test_tool_result_takes_the_name_of_the_call_it_answers(tmp_path):
+    """Results are filed under `user` with no name of their own; pairing is by id.
+
+    Two calls answered out of order, so a positional match would swap the names.
+    The same pairing times the call, and that must keep working.
+    """
+    call = msg("a", None, "assistant", "x", "2026-01-01T10:00:00Z")
+    call["message"]["content"] = [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+        {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "f"}},
+    ]
+    result = msg("b", "a", "user", "x", "2026-01-01T10:00:02Z")
+    result["message"]["content"] = [
+        {"type": "tool_result", "tool_use_id": "t2", "content": "file body"},
+        {"type": "tool_result", "tool_use_id": "t1", "content": "a.py  b.py"},
+        {"type": "tool_result", "tool_use_id": "gone", "content": "orphan"},
+    ]
+    path = write_session(tmp_path, "s6", [call, result])
+    session = next(ClaudeCodeAdapter(root=tmp_path).parse(path.parent, ParseStats()))
+
+    uses = {p.tool_name: p for p in session.messages[0].parts}
+    results = {p.text: p for p in session.messages[1].parts}
+    assert results["file body"].tool_name == "Read"
+    assert results["a.py  b.py"].tool_name == "Bash"
+    assert results["orphan"].tool_name is None       # unknown call: no guess, no crash
+    assert uses["Bash"].duration_ms == uses["Read"].duration_ms == 2000
+
+
 def test_persisted_output_resolves_relative_to_session_dir(tmp_path):
     """The marker's absolute path breaks if ~/.claude moves; resolve by structure."""
     from llm_archive.core.blobs import BlobStore
