@@ -1,9 +1,9 @@
 """A stdio MCP server over the archive: `search`, `show`, `related`, `who_touched`,
-`blame`, `commands`. Read-only.
+`blame`, `commands`, `prime`. Read-only.
 
 The archive answers "have I solved this before?" — but until now only to whoever was
 willing to open a browser tab and read. The agent already sitting in the terminal, about
-to re-derive last March's fix from scratch, had no way in. This is that way in: six
+to re-derive last March's fix from scratch, had no way in. This is that way in: seven
 tools over `api.py`, so an assistant can consult the archive mid-session.
 
 **Read-only, and offline by construction.** Every tool is a SELECT. Nothing here ingests,
@@ -322,6 +322,37 @@ TOOLS = [
         "annotations": _READ_ONLY,
     },
     {
+        "name": "prime",
+        "title": "Compact a session into a context primer",
+        "description":
+            "One archived session reduced to what a fresh session needs from it: the "
+            "opening request whole, the person's later turns whole, the assistant's "
+            "turns trimmed to the paragraphs that argue a decision, every tool call "
+            "dropped except the ones that failed, then an outcome from the archive's "
+            "derived tables — files written, commits made, the last test run — and "
+            "the final reply in full. Use it to pick up where an earlier session "
+            "stopped, or to carry its decisions into this one, without spending "
+            "context on 300 KB of tool output. Extractive, so every line is verbatim "
+            "and citable; `stats` says how much was cut. Returns markdown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "integer",
+                               "description": "From a `search` or `related` result."},
+                "max_chars": {
+                    "type": "integer", "minimum": 2000, "maximum": 100000,
+                    "default": 12000,
+                    "description": "How many characters the primer may spend. The "
+                                   "goal, outcome and final reply are paid for first; "
+                                   "the middle is filled in order and the cut reported.",
+                },
+            },
+            "required": ["session_id"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
         "name": "related",
         "title": "Sessions like this one",
         "description":
@@ -433,6 +464,16 @@ def _tool_show(archive: Archive, args: dict) -> dict:
     return payload
 
 
+def _tool_prime(archive: Archive, args: dict) -> dict:
+    con, _ = archive.open()
+    session_id = _session_id(args)
+    payload = api.prime_payload(
+        con, session_id, chars=_bounded(args.get("max_chars"), 12_000, 2000, 100_000))
+    if payload is None:
+        raise LookupError(f"no session #{session_id} in the archive")
+    return payload
+
+
 def _tool_related(archive: Archive, args: dict) -> dict:
     con, vectors = archive.open()
     session_id = _session_id(args)
@@ -499,7 +540,7 @@ def _tool_blame(archive: Archive, args: dict) -> dict:
 
 HANDLERS = {"search": _tool_search, "show": _tool_show, "related": _tool_related,
             "who_touched": _tool_who_touched, "blame": _tool_blame,
-            "commands": _tool_commands}
+            "commands": _tool_commands, "prime": _tool_prime}
 
 
 # --------------------------------------------------------------- protocol ----

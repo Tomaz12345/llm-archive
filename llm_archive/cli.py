@@ -443,6 +443,7 @@ ROLE_HELP = ("only what this role said: user, assistant (tool output filed under
 KIND_HELP = ("only parts of this kind: text, thinking, tool_use, tool_result — "
              "tool_result finds the session that hit an error, not one that discussed it")
 TOOL_HELP = "only sessions that called this tool, e.g. Bash, Edit (case-insensitive)"
+SINCE_HELP = "YYYY-MM-DD, or a distance back: 7d, 2w, yesterday, last-week, last-month"
 
 
 def _search_filters(**values):
@@ -473,8 +474,8 @@ def search_cmd(
     role: str = typer.Option(None, "--role", help=ROLE_HELP),
     kind: str = typer.Option(None, "--kind", help=KIND_HELP),
     tool: str = typer.Option(None, "--tool", help=TOOL_HELP),
-    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
-    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    since: str = typer.Option(None, "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
     mode: str = typer.Option("hybrid", "--mode",
                              help="hybrid | keyword | semantic"),
     abandoned: bool = typer.Option(False, "--abandoned",
@@ -493,7 +494,7 @@ def search_cmd(
     filters = _search_filters(sources=tuple(source or ()), participant=participant,
                               workspace=workspace, host=host, topic=topic,
                               role=role, kind=kind, tool=tool,
-                              since=api.parse_day(since), until=api.parse_day(until),
+                              since=api.parse_when(since), until=api.parse_when(until),
                               include_abandoned=abandoned)
 
     if json_out:
@@ -521,8 +522,8 @@ def related(
     role: str = typer.Option(None, "--role", help=ROLE_HELP),
     kind: str = typer.Option(None, "--kind", help=KIND_HELP),
     tool: str = typer.Option(None, "--tool", help=TOOL_HELP),
-    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
-    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    since: str = typer.Option(None, "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
     abandoned: bool = typer.Option(False, "--abandoned",
                                    help="include abandoned branches"),
     json_out: bool = typer.Option(False, "--json",
@@ -543,7 +544,7 @@ def related(
     filters = _search_filters(sources=tuple(source or ()), participant=participant,
                               workspace=workspace, host=host, topic=topic,
                               role=role, kind=kind, tool=tool,
-                              since=api.parse_day(since), until=api.parse_day(until),
+                              since=api.parse_when(since), until=api.parse_when(until),
                               include_abandoned=abandoned)
 
     if json_out:
@@ -672,6 +673,48 @@ def open_cmd(
     except reopen.LaunchError as exc:
         typer.echo(str(exc))
         raise typer.Exit(1) from None
+
+
+@app.command()
+def prime(
+    session_id: int = typer.Argument(..., help="session id from search results"),
+    chars: int = typer.Option(12_000, "--chars", "-c",
+                              help="how much of a context window the primer may spend"),
+    out: Path = typer.Option(None, "--out", "-o", help="write the primer here"),
+    no_redact: bool = typer.Option(False, "--no-redact",
+                                   help="leave secrets in (they are redacted by default)"),
+    json_out: bool = typer.Option(False, "--json",
+                                  help="the primer plus what the compaction did"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """One session compacted into a context primer for a fresh agent session.
+
+        llma prime 412                     # to stdout, ~12K chars
+        llma prime 412 --chars 6000 -o primer.md
+        claude "$(llma prime 412)"          # or paste it, or @-mention the file
+
+    Decisions kept, tool noise dropped: your turns whole, the assistant's trimmed to
+    what argues a choice, tool calls gone except the ones that failed, and an outcome
+    from the derived tables -- files written, commits made, the last test run -- plus
+    the final reply in full. Extractive: every line is a span of the archive.
+    """
+    from . import api
+
+    con, _, _ = _open(data_dir)
+    payload = api.prime_payload(con, session_id, chars=chars, redact=not no_redact)
+    if payload is None:
+        typer.echo(f"no session #{session_id}")
+        raise typer.Exit(1)
+    if json_out:
+        _echo_json(payload)
+        return
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload["markdown"], encoding="utf-8")
+        s = payload["stats"]
+        typer.echo(f"{payload['chars']:,} chars from {s['messages']} messages -> {out}")
+        return
+    typer.echo(payload["markdown"], nl=False)
 
 
 @app.command("export")
@@ -932,8 +975,8 @@ def who_touched_cmd(
     source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
     workspace: str = typer.Option(None, "--workspace", "-w"),
     host: str = typer.Option(None, "--host"),
-    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
-    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    since: str = typer.Option(None, "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
     abandoned: bool = typer.Option(False, "--abandoned",
                                    help="include abandoned branches"),
     json_out: bool = typer.Option(False, "--json"),
@@ -953,7 +996,7 @@ def who_touched_cmd(
 
     con, _, _ = _open(data_dir)
     filters = Filters(sources=tuple(source or ()), workspace=workspace, host=host,
-                      since=api.parse_day(since), until=api.parse_day(until),
+                      since=api.parse_when(since), until=api.parse_when(until),
                       include_abandoned=abandoned)
     payload = api.who_touched_payload(
         con, path, limit=limit, actions=tuple(action or ()), writes_only=writes,
@@ -998,8 +1041,8 @@ def commands_cmd(
     source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
     workspace: str = typer.Option(None, "--workspace", "-w"),
     host: str = typer.Option(None, "--host"),
-    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
-    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    since: str = typer.Option(None, "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
     abandoned: bool = typer.Option(False, "--abandoned",
                                    help="include abandoned branches"),
     json_out: bool = typer.Option(False, "--json"),
@@ -1018,7 +1061,7 @@ def commands_cmd(
 
     con, _, _ = _open(data_dir)
     filters = Filters(sources=tuple(source or ()), workspace=workspace, host=host,
-                      since=api.parse_day(since), until=api.parse_day(until),
+                      since=api.parse_when(since), until=api.parse_when(until),
                       include_abandoned=abandoned)
     payload = api.commands_payload(con, substring, limit=limit, program=program,
                                    filters=filters)
@@ -1072,8 +1115,8 @@ def blame_cmd(
     source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
     workspace: str = typer.Option(None, "--workspace", "-w"),
     host: str = typer.Option(None, "--host"),
-    since: str = typer.Option(None, "--since", help="YYYY-MM-DD"),
-    until: str = typer.Option(None, "--until", help="YYYY-MM-DD"),
+    since: str = typer.Option(None, "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
     abandoned: bool = typer.Option(False, "--abandoned",
                                    help="include abandoned branches"),
     json_out: bool = typer.Option(False, "--json"),
@@ -1102,7 +1145,7 @@ def blame_cmd(
 
     con, _, _ = _open(data_dir)
     filters = Filters(sources=tuple(source or ()), workspace=workspace, host=host,
-                      since=api.parse_day(since), until=api.parse_day(until),
+                      since=api.parse_when(since), until=api.parse_when(until),
                       include_abandoned=abandoned)
     try:
         payload = api.blame_payload(con, path, start=start, end=end, limit=limit,
@@ -1347,34 +1390,370 @@ def freshness(
             typer.echo(f"  {row['label']:<16} {row['retention']}")
 
 
-schedule_app = typer.Typer(help="Run `llma sync` on a schedule (Windows Task Scheduler).")
+# ------------------------------------------------------------------ inbox
+
+REASON_HELP = ("only this kind of stop: unanswered (your turn was last), cut-off (the "
+               "agent stopped mid-task), asked-you (it asked and you never said); "
+               "repeatable")
+
+inbox_app = typer.Typer(
+    invoke_without_command=True,
+    help="Sessions that ended waiting on you: unanswered, cut off, or asking something.")
+app.add_typer(inbox_app, name="inbox")
+
+
+@inbox_app.callback(invoke_without_command=True)
+def inbox(
+    ctx: typer.Context,
+    limit: int = typer.Option(50, "--limit", "-n"),
+    reason: list[str] = typer.Option(None, "--reason", "-r", help=REASON_HELP),
+    source: list[str] = typer.Option(None, "--source", "-s", help="repeatable"),
+    workspace: str = typer.Option(None, "--workspace", "-w"),
+    since: str = typer.Option(None, "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
+    min_age: str = typer.Option("1h", "--min-age",
+                                help="skip sessions whose last message is younger than "
+                                     "this -- probably still open somewhere (30m, 6h, "
+                                     "2d; 0 for none)"),
+    all_: bool = typer.Option(False, "--all", help="include dismissed sessions"),
+    json_out: bool = typer.Option(False, "--json"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Sessions that ended waiting on you. A to-do list you already own.
+
+        llma inbox                          # everything still open
+        llma inbox --reason asked-you       # proposals you never answered
+        llma inbox -w payments --since 2w   # one project, recent
+        llma inbox dismiss 412              # done with it (a tag; undo: restore)
+
+    Not the same thing as `--abandoned`, which is about branches inside a session.
+    This is about whole sessions: the last turn is yours, the agent was cut off
+    mid-task, or it asked a question that never got an answer.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    from . import api
+    from .core import unfinished
+
+    con, _, _ = _open(data_dir)
+    try:
+        payload = api.inbox_payload(
+            con, since=api.parse_when(since), until=api.parse_when(until),
+            workspace=workspace, sources=tuple(source or ()),
+            reasons=tuple(reason or ()), min_age_ms=api.parse_duration(min_age) or 0,
+            include_dismissed=all_, limit=limit)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    if json_out:
+        _echo_json(payload)
+        return
+
+    if not payload["count"]:
+        typer.echo("nothing waiting on you")
+        raise typer.Exit()
+
+    tally = " · ".join(f"{n} {r}" for r, n in payload["by_reason"].items() if n)
+    typer.echo(f"{payload['count']} unfinished session(s)   {tally}")
+    if payload["shown"] < payload["count"]:
+        typer.echo(f"showing {payload['shown']} -- raise --limit for the rest")
+
+    # what each stop was left holding: your words, its words, or the step it was on
+    label = {"unanswered": "you", "asked-you": "it asked", "cut-off": "stopped at"}
+    for i, hit in enumerate(payload["results"], start=1):
+        typer.echo(f"\n{i:>2}. {hit.get('title') or '(untitled)'}")
+        when = hit["last_at"][:10] if hit.get("last_at") else "?"
+        where = " · ".join(x for x in (when, hit.get("source"), hit.get("workspace"),
+                                       hit.get("host")) if x)
+        typer.echo(f"    {where} · {hit['reason']}   [#{hit['session_id']}]")
+        if hit["excerpt"]:
+            typer.echo(f"    {label[hit['reason']]:<10} {hit['excerpt'][:150]}")
+
+    first = payload["results"][0]["session_id"]
+    typer.echo(f"\npick one up with: llma open {first}"
+               f"      done with it: llma inbox dismiss {first}")
+
+
+@inbox_app.command("dismiss")
+def inbox_dismiss(
+    ids: list[int] = typer.Argument(..., help="session ids, e.g. 412 413"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Take sessions off the inbox. Adds the tag `dismissed`; nothing is deleted."""
+    from .core import unfinished
+
+    con, _, _ = _open(data_dir)
+    n = unfinished.dismiss(con, ids)
+    typer.echo(f"dismissed {n} session(s)" + ("" if n == len(ids)
+                                              else f" ({len(ids) - n} unknown or already)"))
+
+
+@inbox_app.command("restore")
+def inbox_restore(
+    ids: list[int] = typer.Argument(..., help="session ids"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Put dismissed sessions back on the inbox."""
+    from .core import unfinished
+
+    con, _, _ = _open(data_dir)
+    n = unfinished.restore(con, ids)
+    typer.echo(f"restored {n} session(s)")
+
+
+# ------------------------------------------------------------- housekeeping
+
+@app.command()
+def gc(
+    apply_now: bool = typer.Option(False, "--apply",
+                                   help="reclaim; without it, only report"),
+    vacuum: bool = typer.Option(False, "--vacuum",
+                                help="rewrite the file even when little is free"),
+    json_out: bool = typer.Option(False, "--json"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Reclaim what nothing references any more; report what is merely missing.
+
+        llma gc                 # what could go, and what is gone from disk
+        llma gc --apply         # blobs nothing points at, stale vectors, free pages
+        llma gc --apply --vacuum
+
+    Never touches history: a session whose raw file vanished stays, a drop that was
+    deleted stays on the ledger. The hand-made archive.db.bak-* copies are listed
+    with their sizes and left to you -- `llma snapshot` is what they were for.
+    """
+    from .core import gc as core_gc
+    from .search.embed import MODEL_TAG
+
+    con, blobs, db_path = _open(data_dir)
+    vectors_dir = db_path.parent / "vectors"
+    try:
+        if apply_now:
+            report = core_gc.apply(con, db_path, blobs.root, vectors_dir, MODEL_TAG,
+                                   vacuum=True if vacuum else None)
+        else:
+            report = core_gc.plan(con, db_path, blobs.root, vectors_dir, MODEL_TAG)
+    except core_gc.Busy as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1)
+    if json_out:
+        _echo_json(core_gc.as_dict(report))
+        return
+    typer.echo(core_gc.render(report), nl=False)
+
+
+snapshot_app = typer.Typer(
+    invoke_without_command=True,
+    help="Point-in-time copies of the archive, taken safely under WAL.")
+app.add_typer(snapshot_app, name="snapshot")
+
+
+@snapshot_app.callback(invoke_without_command=True)
+def snapshot_take(
+    ctx: typer.Context,
+    label: str = typer.Option(None, "--label", "-l",
+                              help="a word for the name, e.g. pre-reingest"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Take a snapshot: <data>/snapshots/archive-<date>-<time>[-label].db.
+
+        llma snapshot --label pre-reingest
+        llma snapshot list
+        llma snapshot prune --keep 3
+        llma snapshot restore archive-20260917-0303-schema-v11
+
+    Through sqlite's online backup API, so it is consistent even mid-ingest and
+    includes what is still in the -wal -- which a file copy is not and does not.
+    One is taken for you before every schema migration.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    from .core import ingest, snapshot
+
+    db_path, _ = ingest.default_paths(data_dir)
+    try:
+        snap = snapshot.take(db_path, label)
+    except snapshot.SnapshotError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1)
+    typer.echo(f"{snap.name}  {snap.bytes / 1e6:,.1f} MB  -> {snap.path.parent}")
+
+
+@snapshot_app.command("list")
+def snapshot_list(data_dir: Path = typer.Option(None, "--data-dir")) -> None:
+    """Snapshots on disk, newest first, and the hand-made copies beside the archive."""
+    from .core import ingest, snapshot
+
+    db_path, _ = ingest.default_paths(data_dir)
+    snaps = snapshot.list_snapshots(db_path)
+    if not snaps:
+        typer.echo(f"no snapshots in {snapshot.snapshots_dir(db_path)}")
+    for s in snaps:
+        typer.echo(f"  {s.name:<48} {s.bytes / 1e6:>8,.1f} MB  "
+                   f"{s.taken_at:%Y-%m-%d %H:%M}" + (f"  {s.label}" if s.label else ""))
+    legacy = snapshot.legacy_backups(db_path)
+    if legacy:
+        typer.echo(f"\n{len(legacy)} hand-made copies beside the archive "
+                   f"({sum(b for _, b in legacy) / 1e6:,.0f} MB) -- not managed here:")
+        for p, b in legacy:
+            typer.echo(f"  {p.name:<48} {b / 1e6:>8,.1f} MB")
+
+
+@snapshot_app.command("prune")
+def snapshot_prune(
+    keep: int = typer.Option(3, "--keep", "-k", help="how many newest to leave"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Delete all but the newest --keep snapshots."""
+    from .core import ingest, snapshot
+
+    db_path, _ = ingest.default_paths(data_dir)
+    try:
+        gone = snapshot.prune(db_path, keep)
+    except snapshot.SnapshotError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1)
+    for s in gone:
+        typer.echo(f"  removed {s.name}  ({s.bytes / 1e6:,.1f} MB)")
+    typer.echo(f"{len(gone)} removed, {len(snapshot.list_snapshots(db_path))} kept")
+
+
+@snapshot_app.command("restore")
+def snapshot_restore(
+    name: str = typer.Argument(..., help="a name from `llma snapshot list`"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """Replace the archive with a snapshot. The current one is snapshotted first."""
+    from .core import ingest, snapshot
+
+    db_path, _ = ingest.default_paths(data_dir)
+    try:
+        restored, safety = snapshot.restore(db_path, name)
+    except snapshot.SnapshotError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1)
+    typer.echo(f"restored {restored.name}")
+    typer.echo(f"the archive as it was is {safety.name} -- restore that to undo")
+    typer.echo("run `llma index` if the snapshot predates the last index build")
+
+
+# ------------------------------------------------------------------ digest
+
+@app.command()
+def digest(
+    since: str = typer.Option("last-week", "--since", help=SINCE_HELP),
+    until: str = typer.Option(None, "--until", help=SINCE_HELP),
+    fmt: str = typer.Option("text", "--format", "-f", help="text | md | json"),
+    json_out: bool = typer.Option(False, "--json", help="same as --format json"),
+    out: Path = typer.Option(None, "--out", "-o",
+                             help="write here instead of printing; a directory gets "
+                                  "digest-<date>.md (or .txt / .json)"),
+    data_dir: Path = typer.Option(None, "--data-dir"),
+) -> None:
+    """What happened in a window: sessions per project, what each opened with, the
+    files it wrote, what it would have cost, and the ones you never came back to.
+
+        llma digest                          # the past seven days
+        llma digest --since 2026-09-01 --until 2026-09-08
+        llma digest --format md --out ./digests/     # a file per run
+        llma schedule install --digest       # ... every Monday, unattended
+
+    Extractive and offline: every line is a field the archive holds. A session
+    counts if any of it happened in the window, so a conversation resumed on Monday
+    is on this week's list, marked with the day it began.
+    """
+    from . import api
+    from .stats import digest as build_digest
+
+    fmt = "json" if json_out else fmt.lower()
+    if fmt not in ("text", "md", "json"):
+        raise typer.BadParameter("--format wants text, md or json")
+    try:
+        since_ms, until_ms = api.parse_when(since), api.parse_when(until)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    con, _, _ = _open(data_dir)
+    data = build_digest.build(con, since_ms, until_ms, label=since)
+    if fmt == "json":
+        body = json.dumps(data, ensure_ascii=False, indent=2)
+    elif fmt == "md":
+        body = build_digest.render_markdown(data)
+    else:
+        body = build_digest.render_text(data)
+
+    if out is None:
+        typer.echo(body, nl=False)
+        return
+    # A directory means "file it by date": the scheduled task points here and must
+    # not overwrite last week's report with this one.
+    if out.is_dir() or not out.suffix:
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = (data["until"] or data["generated_at"])[:10]
+        ext = {"md": "md", "json": "json"}.get(fmt, "txt")
+        out = out / f"digest-{stamp}.{ext}"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(body, encoding="utf-8")
+    typer.echo(f"{data['totals']['sessions']} session(s) -> {out}")
+
+
+# ---------------------------------------------------------------- schedule
+
+schedule_app = typer.Typer(help="Run `llma sync` nightly, and `llma digest` weekly "
+                                "(Windows Task Scheduler).")
 app.add_typer(schedule_app, name="schedule")
+
+
+DIGEST_FLAG_HELP = "the weekly digest task rather than the nightly sync"
+
+
+def _task_name(digest: bool) -> str:
+    from .core import schedule as sched
+    return sched.DIGEST_TASK_NAME if digest else sched.TASK_NAME
 
 
 @schedule_app.command("install")
 def schedule_install(
-    at: str = typer.Option("21:00", "--at", help="daily start time, HH:MM 24-hour"),
+    at: str = typer.Option(None, "--at", help="start time, HH:MM 24-hour "
+                                             "(21:00 for sync, 08:00 for the digest)"),
     no_vectors: bool = typer.Option(False, "--no-vectors",
                                     help="nightly keyword-only build; embed by hand"),
+    digest: bool = typer.Option(False, "--digest",
+                                help="register the weekly digest instead: last week "
+                                     "as markdown, into <data>/digests/"),
+    on: str = typer.Option("Monday", "--on", help="weekday for --digest"),
+    out: Path = typer.Option(None, "--out", help="folder for --digest files"),
     dry_run: bool = typer.Option(False, "--dry-run",
                                  help="print the task definition, register nothing"),
     data_dir: Path = typer.Option(None, "--data-dir"),
 ) -> None:
-    """Register a daily task that re-ingests every source and rebuilds the index."""
+    """Register the nightly sync -- or, with --digest, the weekly digest.
+
+    Two tasks, installed one at a time. The digest reads what the sync keeps current,
+    so its default hour is the morning after: Monday 08:00 sees Sunday 21:00's run.
+    """
     from .core import schedule as sched
 
     try:
-        plan = sched.make_plan(data_dir, at=at, with_vectors=not no_vectors)
+        if digest:
+            plan = sched.make_digest_plan(data_dir, at=at or sched.DIGEST_AT, on=on,
+                                          out_dir=out)
+        else:
+            plan = sched.make_plan(data_dir, at=at or sched.DEFAULT_AT,
+                                   with_vectors=not no_vectors)
         xml = sched.build_xml(plan)          # validates --at before touching anything
     except ValueError as exc:
         typer.echo(str(exc))
         raise typer.Exit(1)
 
-    typer.echo(f"task       {sched.TASK_NAME}")
-    typer.echo(f"runs       daily at {plan.at}, and on the next wake if the machine "
+    typer.echo(f"task       {plan.task_name}")
+    typer.echo(f"runs       {plan.when()}, and on the next wake if the machine "
                f"was asleep")
     typer.echo(f"command    {plan.describe()}")
-    typer.echo(f"log        {plan.log_path}")
+    if digest:
+        typer.echo(f"writes     {plan.out_dir}\\digest-<date>.md")
+    else:
+        typer.echo(f"log        {plan.log_path}")
 
     if dry_run:
         typer.echo("\n" + xml)
@@ -1388,16 +1767,20 @@ def schedule_install(
     except sched.SchedulerError as exc:
         typer.echo(f"\nTask Scheduler refused: {exc}")
         raise typer.Exit(1)
-    typer.echo("\nregistered. Check it with: llma schedule status")
+    check = "llma schedule status" + (" --digest" if digest else "")
+    typer.echo(f"\nregistered. Check it with: {check}")
 
 
 @schedule_app.command("status")
-def schedule_status() -> None:
+def schedule_status(
+    digest: bool = typer.Option(False, "--digest", help=DIGEST_FLAG_HELP),
+) -> None:
     """Is the task registered, when did it last run, and did that run succeed?"""
     from .core import schedule as sched
 
+    task = _task_name(digest)
     try:
-        info = sched.status()
+        info = sched.status(task)
     except sched.NotWindows as exc:
         typer.echo(str(exc))
         raise typer.Exit(1)
@@ -1406,10 +1789,11 @@ def schedule_status() -> None:
         raise typer.Exit(1)
 
     if info is None:
-        typer.echo("not registered — run: llma schedule install")
+        typer.echo("not registered — run: llma schedule install"
+                   + (" --digest" if digest else ""))
         raise typer.Exit()
 
-    typer.echo(f"task        {sched.TASK_NAME}")
+    typer.echo(f"task        {task}")
     typer.echo(f"state       {info.get('state')}")
     typer.echo(f"last run    {info.get('last_run') or 'never'}")
     typer.echo(f"next run    {info.get('next_run') or '-'}")
@@ -1429,12 +1813,14 @@ def schedule_status() -> None:
 
 
 @schedule_app.command("remove")
-def schedule_remove() -> None:
+def schedule_remove(
+    digest: bool = typer.Option(False, "--digest", help=DIGEST_FLAG_HELP),
+) -> None:
     """Unregister the task. The archive and its indexes are untouched."""
     from .core import schedule as sched
 
     try:
-        removed = sched.remove()
+        removed = sched.remove(_task_name(digest))
     except sched.NotWindows as exc:
         typer.echo(str(exc))
         raise typer.Exit(1)
@@ -1445,16 +1831,19 @@ def schedule_remove() -> None:
 
 
 @schedule_app.command("run")
-def schedule_run() -> None:
+def schedule_run(
+    digest: bool = typer.Option(False, "--digest", help=DIGEST_FLAG_HELP),
+) -> None:
     """Start the registered task now, the way the scheduler would."""
     from .core import schedule as sched
 
     try:
-        sched.run_now()
+        sched.run_now(_task_name(digest))
     except (sched.NotWindows, sched.SchedulerError) as exc:
         typer.echo(str(exc))
         raise typer.Exit(1)
-    typer.echo("started — output goes to the task's log, not here")
+    typer.echo("started — output goes to the task's " + ("folder" if digest else "log")
+               + ", not here")
 
 
 @app.command()

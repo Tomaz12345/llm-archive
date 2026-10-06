@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Digest — Session Archive{% endblock %}
+
+{% block body %}
+<div class="dash">
+<h1>Digest</h1>
+<p class="sub">
+  What happened in a window: sessions per project, what each opened with, the files
+  it wrote, what the tokens would list for, and the ones you never came back to.
+  A session counts if any of it happened in the window. The same report as
+  <code>llma digest</code>; <code>llma schedule install --digest</code> writes one
+  every Monday.
+</p>
+
+<form method="get" action="/digest" class="tagbar">
+  <label>since
+    <select name="since">
+      {% for v, label in [("7d", "last 7 days"), ("2w", "last 2 weeks"),
+                          ("last-month", "last 30 days"), ("today", "today"),
+                          ("yesterday", "since yesterday")] %}
+        <option value="{{ v }}" {% if v == since %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+      {% if since not in ("7d", "2w", "last-month", "today", "yesterday") %}
+        <option value="{{ since }}" selected>{{ since }}</option>
+      {% endif %}
+    </select>
+  </label>
+  <label>until <input type="text" name="until" value="{{ until }}" placeholder="now"
+                      size="12" title="YYYY-MM-DD, or a distance back like 2d"></label>
+  <button type="submit">Show</button>
+  {% if error %}<span class="warn-line">{{ error }}</span>{% endif %}
+</form>
+
+<section class="panel">
+  <div class="body md">{{ html|safe }}</div>
+</section>
+</div>
+{% endblock %}

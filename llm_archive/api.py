@@ -24,10 +24,11 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .core import lineage, reopen
+from .core import lineage, reopen, unfinished
 from .search.hybrid import Filters, Hit, related as run_related, search as run_search
 
 # Ceilings, all overridable per call. A snippet is a hook to decide whether to open the
@@ -81,6 +82,54 @@ def parse_day(value: str | None) -> int | None:
                    .replace(tzinfo=timezone.utc).timestamp() * 1000)
     except ValueError:
         raise ValueError(f"date must be YYYY-MM-DD, got {value!r}") from None
+
+
+_DAY_MS = 86_400_000
+_UNIT_MS = {"m": 60_000, "h": 3_600_000, "d": _DAY_MS, "w": 7 * _DAY_MS}
+_RELATIVE = re.compile(r"^(\d+)\s*([mhdw])$")
+_WORDS = {"last-week": 7 * _DAY_MS, "last-month": 30 * _DAY_MS}
+
+
+def parse_when(value: str | None, *, now_ms: int | None = None) -> int | None:
+    """A day or a distance back from now, as epoch ms. Everything `parse_day` takes,
+    plus `today`, `yesterday`, `last-week`, `last-month` and `7d` / `2w` / `6h`.
+
+    The words are rolling windows, not calendar ones: `last-week` is the past seven
+    days, so `--since last-week` on a Wednesday reaches back to last Wednesday rather
+    than to Monday. `today` and `yesterday` are UTC midnights, the clock everything
+    stored here already uses.
+    """
+    if not value:
+        return None
+    word = value.strip().lower()
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    if word == "today":
+        return now - now % _DAY_MS
+    if word == "yesterday":
+        return now - now % _DAY_MS - _DAY_MS
+    if word in _WORDS:
+        return now - _WORDS[word]
+    m = _RELATIVE.match(word)
+    if m:
+        return now - int(m.group(1)) * _UNIT_MS[m.group(2)]
+    try:
+        return parse_day(value)
+    except ValueError:
+        raise ValueError(f"expected YYYY-MM-DD, today, yesterday, last-week, "
+                         f"last-month or 7d / 2w / 6h; got {value!r}") from None
+
+
+def parse_duration(value: str | None) -> int | None:
+    """`30m`, `6h`, `2d`, `1w` to milliseconds; `0` for none."""
+    if value is None:
+        return None
+    word = value.strip().lower()
+    if word in ("0", "none"):
+        return 0
+    m = _RELATIVE.match(word)
+    if not m:
+        raise ValueError(f"expected a duration like 30m, 6h, 2d or 1w; got {value!r}")
+    return int(m.group(1)) * _UNIT_MS[m.group(2)]
 
 
 def _text(value: str | None, limit: int) -> dict:
@@ -456,6 +505,57 @@ def session_commands(con: sqlite3.Connection, session_id: int,
         GROUP BY argv0 ORDER BY runs DESC LIMIT ?""", (session_id, limit)).fetchall()
     return [{"program": r["argv0"], "runs": r["runs"], "last_at": iso(r["last_at"])}
             for r in rows]
+
+
+# --- unfinished sessions -----------------------------------------------------
+
+
+def inbox_payload(con: sqlite3.Connection, *, since: int | None = None,
+                  until: int | None = None, workspace: str | None = None,
+                  sources: tuple[str, ...] = (), reasons: tuple[str, ...] = (),
+                  min_age_ms: int = unfinished.DEFAULT_MIN_AGE_MS,
+                  include_dismissed: bool = False, limit: int | None = None) -> dict:
+    """Sessions that ended waiting on you, most recently stopped first.
+
+    `by_reason` counts the whole matching set even when `limit` cuts the list, so a
+    caller can say "3 of 34" rather than "3".
+    """
+    items = unfinished.find(con, since=since, until=until, workspace=workspace,
+                            sources=sources, reasons=reasons, min_age_ms=min_age_ms,
+                            include_dismissed=include_dismissed)
+    shown = items[:limit] if limit is not None else items
+    results = []
+    for item in shown:
+        row = session_row(con, item.session_id)
+        results.append({
+            **(session_brief(row) if row is not None
+               else {"session_id": item.session_id}),
+            "reason": item.reason,
+            "last_at": iso(item.last_at),
+            "excerpt": item.excerpt,
+        })
+    return {"count": len(items), "shown": len(results),
+            "by_reason": unfinished.counts(items), "results": results}
+
+
+# --- context primer ----------------------------------------------------------
+
+
+def prime_payload(con: sqlite3.Connection, session_id: int, *,
+                  chars: int = 12_000, redact: bool = True) -> dict | None:
+    """One session compacted for a fresh agent's context. See export/prime.py.
+
+    The markdown is the deliverable; `stats` says what the compaction did, so a
+    reader can tell a thin session from a deep cut before deciding to trust it.
+    """
+    from .export import prime
+
+    built = prime.build(con, session_id, chars=chars, redact=redact)
+    if built is None:
+        return None
+    row = session_row(con, session_id)
+    return {"session": session_brief(row), "markdown": built.markdown,
+            "chars": len(built.markdown), "stats": built.stats}
 
 
 # --- git blame bridge --------------------------------------------------------

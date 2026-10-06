@@ -553,7 +553,23 @@ def connect(path: Path) -> sqlite3.Connection:
     else:
         row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         current = int(row["value"]) if row else 1
-        for version in sorted(v for v in MIGRATIONS if v > current):
+        pending = sorted(v for v in MIGRATIONS if v > current)
+        if pending:
+            # The copy the five hand-made `archive.db.bak-*` files were, taken by the
+            # code instead: a migration that fails halfway is the one moment a copy
+            # from a minute earlier is worth everything. Through the backup API, so
+            # it is consistent under WAL. A snapshot that cannot be written stops the
+            # migration rather than proceeding without one -- that is the point of it.
+            from . import snapshot
+            try:
+                snapshot.take(path, f"schema-v{current}", con=con)
+            except (OSError, sqlite3.Error, snapshot.SnapshotError) as exc:
+                con.close()
+                raise RuntimeError(
+                    f"schema v{current} -> v{SCHEMA_VERSION} needs a snapshot first and "
+                    f"could not write one to {snapshot.snapshots_dir(path)}: {exc}"
+                ) from exc
+        for version in pending:
             for statement in MIGRATIONS[version]:
                 try:
                     # a step can be a callable when one ALTER cannot express it

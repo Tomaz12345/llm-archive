@@ -30,7 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from ..core import db, idb, ingest, lineage, reopen
+from ..core import db, idb, ingest, lineage, reopen, unfinished
 from ..core.blobs import IMAGE_MIMES, BlobStore, blob_path, sniff_file
 from ..export.render import (
     caption_of as _caption,
@@ -538,6 +538,21 @@ def create_app(data_dir: Path | None = None, *,
     def session_export_md(session_id: int, tools: bool = True, abandoned: bool = True):
         return _export_md(session_id, tools=tools, abandoned=abandoned)
 
+    @app.get("/session/{session_id}/prime.md")
+    def session_prime(session_id: int, chars: int = 12_000):
+        """The session as a context primer -- what `llma prime` prints, as a file to
+        drop into a fresh agent session."""
+        from .. import api
+
+        payload = api.prime_payload(connect(), session_id,
+                                    chars=max(2000, min(chars, 100_000)))
+        if payload is None:
+            return PlainTextResponse(f"no session #{session_id}", status_code=404)
+        return PlainTextResponse(
+            payload["markdown"], media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{_export_name(session_id)}-primer.md"'})
+
     @app.get("/export")
     def export_many(workspace: str = "", source: str = "", participant: str = "",
                     host: str = "", tag: str = "", model_type: str = ""):
@@ -830,6 +845,85 @@ def create_app(data_dir: Path | None = None, *,
             "host": host, "tag": tag, "model_type": model_type, "topic": topic,
             "offset": offset, "limit": limit,
         })
+
+    # ------------------------------------------------------------------ inbox
+
+    @app.get("/inbox", response_class=HTMLResponse)
+    def inbox_view(request: Request, reason: str = "", workspace: str = "",
+                   since: str = "", dismissed: bool = False):
+        """Sessions that ended waiting on you. See core.unfinished for the rules.
+
+        `min_age` is the module default (an hour): a session still open on another
+        screen is not a to-do item yet. Dismissed ones are hidden unless asked for,
+        and come back with their tag showing so the undo is one click.
+        """
+        from .. import api
+
+        con = connect()
+        reasons = (reason,) if reason in unfinished.REASONS else ()
+        try:
+            since_ms = api.parse_when(since)
+        except ValueError:
+            since_ms = None
+        items = unfinished.find(con, reasons=reasons, workspace=workspace or None,
+                                since=since_ms, include_dismissed=dismissed)
+        # counted before the reason filter, so the tabs say what each one holds
+        every = items if not reasons else unfinished.find(
+            con, workspace=workspace or None, since=since_ms, include_dismissed=dismissed)
+        targets = reopen.targets_for(con, [it.session_id for it in items])
+        dismissed_ids = {r["session_id"] for r in con.execute(
+            """SELECT st.session_id FROM session_tag st JOIN tag t ON t.id = st.tag_id
+                WHERE t.name = ?""", (unfinished.DISMISS_TAG,))}
+        return templates.TemplateResponse(request, "inbox.html", {
+            "items": [{"it": it, "when": _fmt(it.last_at),
+                       "target": targets.get(it.session_id),
+                       "dismissed": it.session_id in dismissed_ids}
+                      for it in items],
+            "by_reason": unfinished.counts(every), "total": len(every),
+            "reasons": unfinished.REASONS, "reason": reason,
+            "workspace": workspace, "since": since, "dismissed": dismissed,
+            "facets": facets(con), "totals": totals(con),
+        })
+
+    @app.get("/digest", response_class=HTMLResponse)
+    def digest_view(request: Request, since: str = "last-week", until: str = ""):
+        """The same report `llma digest` prints, with session ids as links.
+
+        Rendered from the markdown form rather than a template of its own: the
+        builder already decides what is worth saying, and one rendering that is
+        identical on disk and on screen is worth more than a second layout.
+        """
+        from .. import api
+        from ..stats import digest as build_digest
+
+        con = connect()
+        error = None
+        try:
+            since_ms, until_ms = api.parse_when(since), api.parse_when(until)
+        except ValueError as exc:
+            error, since_ms, until_ms = str(exc), api.parse_when("last-week"), None
+        data = build_digest.build(con, since_ms, until_ms, label=since)
+        md = build_digest.render_markdown(data, session_url=lambda sid: f"/session/{sid}")
+        return templates.TemplateResponse(request, "digest.html", {
+            "html": _render_markdown_raw(md), "d": data, "since": since,
+            "until": until, "error": error, "totals": totals(con),
+        })
+
+    def _back_to_inbox(request: Request) -> RedirectResponse:
+        # the filters the person was looking through, kept across the round trip
+        query = request.headers.get("referer", "")
+        suffix = query[query.index("?"):] if "/inbox?" in query else ""
+        return RedirectResponse(f"/inbox{suffix}", status_code=303)
+
+    @app.post("/inbox/{session_id}/dismiss")
+    def inbox_dismiss(request: Request, session_id: int):
+        unfinished.dismiss(connect(), [session_id])
+        return _back_to_inbox(request)
+
+    @app.post("/inbox/{session_id}/restore")
+    def inbox_restore(request: Request, session_id: int):
+        unfinished.restore(connect(), [session_id])
+        return _back_to_inbox(request)
 
     # -------------------------------------------------------------- importing
 

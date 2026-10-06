@@ -44,6 +44,18 @@ DEFAULT_AT = "21:00"
 # runaway-guard, not a budget.
 TIME_LIMIT = "PT2H"
 
+# The second job: a weekly digest written to a file, so Monday morning starts with
+# last week already on disk. It reads the archive the nightly sync keeps current and
+# is scheduled after it, not with it -- a digest built from a sync still running
+# would describe the week up to yesterday.
+DIGEST_TASK_NAME = "LLM Archive Digest"
+DIGEST_AT = "08:00"
+DIGEST_ON = "Monday"
+DIGEST_TIME_LIMIT = "PT10M"
+
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+            "Sunday")
+
 
 class NotWindows(RuntimeError):
     """Raised on platforms with no Task Scheduler, with the local equivalent."""
@@ -55,25 +67,49 @@ class SchedulerError(RuntimeError):
 
 @dataclass(frozen=True)
 class Plan:
-    """Everything the task will do, resolved to absolute paths before anything runs."""
+    """Everything the task will do, resolved to absolute paths before anything runs.
+
+    `job` is `sync` (daily) or `digest` (weekly, on `weekly_on`); the two differ in
+    the command, the trigger and the time limit, and nothing else.
+    """
     python: Path
     project_root: Path
     data_dir: Path | None
     log_path: Path
     at: str
     with_vectors: bool
+    job: str = "sync"
+    weekly_on: str | None = None       # digest only
+    out_dir: Path | None = None        # digest only: where the .md files land
+
+    @property
+    def task_name(self) -> str:
+        return DIGEST_TASK_NAME if self.job == "digest" else TASK_NAME
+
+    @property
+    def time_limit(self) -> str:
+        return DIGEST_TIME_LIMIT if self.job == "digest" else TIME_LIMIT
 
     @property
     def arguments(self) -> str:
-        args = ["-m", "llm_archive.cli", "sync", "--log", f'"{self.log_path}"']
+        if self.job == "digest":
+            args = ["-m", "llm_archive.cli", "digest", "--since", "last-week",
+                    "--format", "md", "--out", f'"{self.out_dir}"']
+        else:
+            args = ["-m", "llm_archive.cli", "sync", "--log", f'"{self.log_path}"']
         if self.data_dir is not None:
             args += ["--data-dir", f'"{self.data_dir}"']
-        if not self.with_vectors:
+        if self.job == "sync" and not self.with_vectors:
             args.append("--no-vectors")
         return " ".join(args)
 
     def describe(self) -> str:
         return f'"{self.python}" {self.arguments}'
+
+    def when(self) -> str:
+        if self.job == "digest":
+            return f"weekly on {self.weekly_on} at {self.at}"
+        return f"daily at {self.at}"
 
 
 def _windowless_python() -> Path:
@@ -101,6 +137,30 @@ def make_plan(data_dir: Path | None = None, at: str = DEFAULT_AT,
     )
 
 
+def make_digest_plan(data_dir: Path | None = None, at: str = DIGEST_AT,
+                     on: str = DIGEST_ON, out_dir: Path | None = None) -> Plan:
+    """The weekly digest task. `out_dir` defaults to `<data>/digests/`; the digest
+    command names each file after the day it was written."""
+    from . import ingest
+
+    day = _validate_weekday(on)
+    db_path, _ = ingest.default_paths(data_dir)
+    base = make_plan(data_dir, at=at)
+    return Plan(
+        python=base.python, project_root=base.project_root, data_dir=base.data_dir,
+        log_path=base.log_path, at=at, with_vectors=True, job="digest",
+        weekly_on=day,
+        out_dir=(out_dir or (db_path.parent / "digests")).resolve(),
+    )
+
+
+def _validate_weekday(on: str) -> str:
+    for day in WEEKDAYS:
+        if day.lower() == (on or "").strip().lower():
+            return day
+    raise ValueError(f"--on wants a weekday name, got {on!r}")
+
+
 def _validate_time(at: str) -> str:
     try:
         hh, mm = at.split(":")
@@ -124,16 +184,24 @@ def build_xml(plan: Plan) -> str:
     # scheduler advances it to the next occurrence. A fixed one keeps the XML stable so
     # re-installing does not look like a change.
     start = f"2026-01-01T{at}:00"
+    if plan.job == "digest":
+        description = ("Write last week's digest of LLM sessions to a file.\n"
+                       "Created by: llma schedule install --digest")
+        schedule = (f"<ScheduleByWeek><DaysOfWeek><{plan.weekly_on}/></DaysOfWeek>"
+                    f"<WeeksInterval>1</WeeksInterval></ScheduleByWeek>")
+    else:
+        description = ("Re-ingest local LLM session stores and rebuild the search "
+                       "index.\nCreated by: llma schedule install")
+        schedule = "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>"
     return f"""<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Re-ingest local LLM session stores and rebuild the search index.
-Created by: llma schedule install</Description>
+    <Description>{description}</Description>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
       <StartBoundary>{start}</StartBoundary>
       <Enabled>true</Enabled>
-      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+      {schedule}
     </CalendarTrigger>
   </Triggers>
   <Principals>
@@ -152,7 +220,7 @@ Created by: llma schedule install</Description>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
-    <ExecutionTimeLimit>{TIME_LIMIT}</ExecutionTimeLimit>
+    <ExecutionTimeLimit>{plan.time_limit}</ExecutionTimeLimit>
     <Priority>7</Priority>
     <IdleSettings>
       <StopOnIdleEnd>false</StopOnIdleEnd>
@@ -184,10 +252,13 @@ def _powershell(script: str) -> str:
     return proc.stdout
 
 
-def install(plan: Plan, task_name: str = TASK_NAME) -> None:
+def install(plan: Plan, task_name: str | None = None) -> None:
     """Register (or replace) the task. Replacing is the normal case — re-running
     `install` after moving the project is how the recorded paths get corrected."""
+    task_name = task_name or plan.task_name
     xml = build_xml(plan)
+    if plan.out_dir is not None:
+        plan.out_dir.mkdir(parents=True, exist_ok=True)
     plan.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Via a UTF-8 temp file rather than inline: the XML contains quotes and newlines,

@@ -257,7 +257,7 @@ def test_tools_list_is_read_only_all_the_way_down(archive):
     frame = mcp.dispatch(archive, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     tools = frame["result"]["tools"]
     assert [t["name"] for t in tools] == ["search", "show", "who_touched", "blame",
-                                          "commands", "related"]
+                                          "commands", "prime", "related"]
     assert all(t["annotations"]["readOnlyHint"] for t in tools)
 
 

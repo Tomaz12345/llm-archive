@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}Inbox — Session Archive{% endblock %}
+
+{% block body %}
+<form class="layout" method="get" action="/inbox">
+  <aside class="filters">
+    {# The reason tabs count the whole set, not the filtered one, so each says what it
+       holds before you click it. #}
+    <div class="fgroup">
+      <h3>Stopped how</h3>
+      <select name="reason">
+        <option value="">any reason ({{ total }})</option>
+        {% for r in reasons %}
+          <option value="{{ r }}" {% if r == reason %}selected{% endif %}>
+            {{ r }} ({{ by_reason[r] }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="fgroup">
+      <h3>Project</h3>
+      <select name="workspace">
+        <option value="">any project</option>
+        {% for w in facets.workspaces %}
+          <option value="{{ w.label }}" {% if w.label == workspace %}selected{% endif %}>
+            {{ w.label }} ({{ w.n }})
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="fgroup">
+      <h3>Started since</h3>
+      <select name="since">
+        <option value="">any time</option>
+        {% for v, label in [("7d", "last 7 days"), ("2w", "last 2 weeks"),
+                            ("last-month", "last 30 days")] %}
+          <option value="{{ v }}" {% if v == since %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="fgroup">
+      <label class="check">
+        <input type="checkbox" name="dismissed" value="true" {% if dismissed %}checked{% endif %}>
+        <span>show dismissed</span>
+      </label>
+    </div>
+    <button type="submit" class="apply">Apply</button>
+    <a class="clear" href="/inbox">Clear all</a>
+  </aside>
+
+  <main>
+    <p class="meta">
+      {{ items|length }} session{{ "" if items|length == 1 else "s" }} waiting on you
+      — the last turn was yours, the agent was cut off mid-task, or it asked something
+      nobody answered. Not the same as an abandoned <em>branch</em>: these are whole
+      conversations. Sessions younger than an hour are left out; they are probably
+      still open somewhere.
+    </p>
+
+    {% if not items %}
+      <p class="meta">Nothing here. Either every session got its answer, or the ones
+        that did not were dismissed — tick <em>show dismissed</em> to see those.</p>
+    {% endif %}
+
+    {% for item in items %}
+      {% set it = item.it %}
+      <article class="hit">
+        <a class="hit-title" href="/session/{{ it.session_id }}">{{ it.title or "(untitled)" }}</a>
+        <span class="badge {% if it.reason == 'cut-off' %}warn{% endif %}">{{ it.reason }}</span>
+        {% if item.dismissed %}<span class="tag">dismissed</span>{% endif %}
+        {% if item.target and item.target.mode == "url" and not item.target.blocked %}
+          <a class="hit-open" href="{{ item.target.url }}" target="_blank"
+             rel="noopener" title="{{ item.target.label }}">↗</a>
+        {% endif %}
+        <div class="hit-meta">
+          <span>{{ item.when }}</span>
+          <span class="chip src-{{ it.source }}">{{ it.source }}</span>
+          {% if it.workspace %}
+            <a href="/workspace/{{ it.workspace|urlencode }}">{{ it.workspace }}</a>
+          {% endif %}
+          {% if it.host %}<span>{{ it.host }}</span>{% endif %}
+          <span>#{{ it.session_id }}</span>
+        </div>
+        {% if it.excerpt %}
+          <p class="snippet">
+            <span class="role">{{ {"unanswered": "you", "asked-you": "it asked",
+                                   "cut-off": "stopped at"}[it.reason] }}</span>
+            {{ it.excerpt }}
+          </p>
+        {% endif %}
+        <div class="rtools">
+          {# The reopen control from the session page, one per card: a CLI session is
+             resumed by the server, anything else is a link. #}
+          {% if item.target and not item.target.blocked %}
+            {% if item.target.mode == "url" %}
+              <a class="open" href="{{ item.target.url }}" target="_blank" rel="noopener"
+                 title="{{ item.target.warn or item.target.url }}">{{ item.target.label }}</a>
+            {% else %}
+              <button type="button" class="open" data-open="/session/{{ it.session_id }}/open"
+                      title="{{ item.target.display }}  (in {{ item.target.cwd }})">
+                {{ item.target.label }}
+              </button>
+            {% endif %}
+          {% elif item.target %}
+            <span class="open-blocked" title="{{ item.target.blocked }}">can’t reopen ⓘ</span>
+          {% endif %}
+          {# formaction, because this whole page is one GET form for the filters #}
+          {% if item.dismissed %}
+            <button type="submit" class="done" formmethod="post"
+                    formaction="/inbox/{{ it.session_id }}/restore">restore</button>
+          {% else %}
+            <button type="submit" class="done" formmethod="post"
+                    formaction="/inbox/{{ it.session_id }}/dismiss"
+                    title="take it off the list; adds the tag ‘dismissed’, deletes nothing">done</button>
+          {% endif %}
+        </div>
+      </article>
+    {% endfor %}
+  </main>
+</form>
+
+<script>
+(function () {
+  // Same contract as the session page's button, for every card on this one: the
+  // server spawns the terminal, and a refusal lands on the button, not in a console.
+  function flash(el, text) {
+    var was = el.textContent;
+    el.textContent = text;
+    setTimeout(function () { el.textContent = was; }, 2500);
+  }
+  document.querySelectorAll("button.open[data-open]").forEach(function (open) {
+    open.addEventListener("click", function () {
+      open.disabled = true;
+      fetch(open.dataset.open, { method: "POST" })
+        .then(function (r) { return r.json().then(function (b) { return [r.ok, b]; }); })
+        .then(function (pair) {
+          flash(open, pair[0] ? "opened" : (pair[1].error || "could not open"));
+          if (!pair[0]) open.title = pair[1].error || open.title;
+        })
+        .catch(function (err) { flash(open, String(err)); })
+        .then(function () { open.disabled = false; });
+    });
+  });
+})();
+</script>
+{% endblock %}

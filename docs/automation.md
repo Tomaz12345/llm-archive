@@ -274,12 +274,30 @@ Get-ScheduledTask "LLM Archive Serve" | Get-ScheduledTaskInfo
 Unregister-ScheduledTask "LLM Archive Serve" -Confirm:$false
 ```
 
+### The weekly digest
+
+A second task, installed separately, that writes last week's digest to a file:
+
+```
+llma schedule install --digest                  # Mondays 08:00 -> data/digests/digest-<date>.md
+llma schedule install --digest --on friday --at 17:30 --out D:/reports
+llma schedule status --digest
+llma schedule run --digest
+llma schedule remove --digest
+```
+
+It is the same report as `llma digest --since last-week --format md`, and it reads what
+the nightly sync keeps current, which is why its default hour is the morning after: a
+digest built while a sync is still running would describe the week up to yesterday.
+The time limit is ten minutes rather than two hours — it is one read, not an embed pass.
+
 ### Other platforms
 
 `llma schedule` is Windows-only and says so. The equivalent is a crontab line:
 
 ```
 0 21 * * *  /path/to/python -m llm_archive.cli sync --log ~/llm-archive-sync.log
+0 8  * * 1  /path/to/python -m llm_archive.cli digest --since last-week --format md --out ~/llm-archive/digests
 ```
 
 ---
@@ -416,7 +434,49 @@ afterwards. `llma sync` and `llma ingest` order it correctly on their own.
 
 ---
 
-## 4. OpenRouter browser storage — built, Firefox only
+## 4. Snapshots and garbage collection
+
+```
+llma snapshot                       # data/snapshots/archive-<date>-<time>.db
+llma snapshot --label pre-reingest
+llma snapshot list                  # newest first; also lists the hand-made .bak-* copies
+llma snapshot prune --keep 3
+llma snapshot restore archive-20260917-0303-schema-v11   # the current one is snapshotted first
+```
+
+A snapshot goes through sqlite's online backup API, never a file copy. The archive runs
+in WAL mode, so `archive.db` on its own can be missing every write still sitting in
+`archive.db-wal`, and a copy taken mid-ingest is a database that opens and is wrong.
+The backup API reads pages under the database's own locks and folds the WAL in.
+`restore` writes the same way, in the other direction, which is what keeps a stale
+`-wal` from being replayed over the restored pages on the next open.
+
+**One is taken for you before every schema migration**, labelled with the version the
+archive had (`schema-v11`). That is what the `archive.db.bak-*` files beside the
+archive were, done by hand each time; `llma gc` lists those with their sizes and leaves
+deleting them to you.
+
+```
+llma gc               # report: what could go, what is merely gone from disk
+llma gc --apply       # reclaim it
+llma gc --apply --vacuum
+```
+
+Reclaimed: blob rows no part points at (and their files) — `upsert_session` rewrites a
+re-parsed message's parts and never deletes a blob, so a `--force` re-ingest after a
+parser change can strand the old overflow content; blob files with no row (a restore
+leaves these); `chunk` rows and `vectors/*.npy` of a previous embedding model, which
+`llma index` never deletes; and free pages, with `VACUUM` when there are enough to be
+worth rewriting the file. Rows go in one transaction, files after the commit, under the
+same lock the nightly sync takes.
+
+Reported and kept, always: sessions whose raw file is gone (the archive is now the only
+copy — that is the point of it) and drop-ledger rows whose file is gone (the row is what
+stops the same export being re-sniffed).
+
+---
+
+## 5. OpenRouter browser storage — built, Firefox only
 
 §2.1's last open item, now closed. Usage is in §0 above (`llma browser --enable`); this
 records how the decision went, because the answer reversed itself.

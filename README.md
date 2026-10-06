@@ -54,6 +54,14 @@ without anyone tagging anything. And a conversation resumed into a fresh transcr
 Claude Code's `--resume` does this -- is detected and linked, so two session rows that are
 one conversation say so, and the replayed half stops being counted twice on the dashboard.
 
+**An inbox of what you walked away from.** `llma inbox` lists the sessions that ended
+waiting on you: your turn was the last one, the agent was cut off mid-task, or it closed
+with "want me to add that?" and nobody said. Not the same as an abandoned *branch* —
+these are whole conversations, and each card reopens where it left off. Two of the
+rules had to be measured before they could be trusted: a web chat's closing question is
+nearly always its sign-off, so that rule is agent-only; and a trailing tool call only
+counts as a stop where the source records tool results at all.
+
 **Runs entirely offline,** with one deliberate exception. The embedding model is local
 (118M params, ONNX, CPU). No API keys, no cloud, no telemetry. The web UI binds to
 `127.0.0.1` and vendors nothing from a CDN. The exception is `fetch-images`: T3 Chat
@@ -78,7 +86,7 @@ on another machine, or from an export that carries no conversation id — it say
 rather than offering a link that 404s.
 
 **Your agents can read it too.** `llma mcp` serves the archive to any MCP client over
-stdio — search, show, related, who-touched, blame and commands, all read-only — so Claude
+stdio — search, show, related, who-touched, blame, commands and prime, all read-only — so Claude
 Code can answer *"have I solved this before?"* and *"why is this line like this?"*
 mid-session instead of you alt-tabbing to the web UI. The
 transport is a pipe: no socket, no key, nothing leaves the machine. Everything the tools
@@ -96,6 +104,28 @@ these formats records a hostname, so without it three laptops collapse into one 
 
 **Stays current on its own.** `llma schedule install` registers a nightly re-ingest and
 re-index; `llma freshness` tells you which web exports have gone stale.
+
+**Pick up where a session stopped.** `llma prime 412` compacts one session into a
+context primer for a fresh agent session: your turns whole, the assistant's trimmed to
+the paragraphs that argue a decision, every tool call dropped except the ones that
+failed, then an outcome no transcript has — the files it wrote, the commits it made, the
+last test run — and the final reply in full. The 443-message session it was first run
+on came out at 12K characters, none of them paraphrased. Also an MCP tool, so the agent
+can ask for it itself.
+
+**Housekeeping that keeps its promises.** `llma snapshot` copies the archive through
+sqlite's online backup API — consistent even while an ingest is writing, and including
+what a file copy of `archive.db` misses in the `-wal` — and one is taken for you before
+every schema migration. `llma gc` reclaims only what nothing references: blobs no part
+points at, chunks and vectors of a previous embedding model, free pages. A session whose
+raw file vanished and an export that was deleted are reported and kept; the archive is
+the copy.
+
+**A digest of the week.** `llma digest --since last-week` is the archive as a report:
+sessions per project, what each opened with, the files it wrote, what the tokens would
+list for, and the ones you never came back to. Extractive and offline — every line is a
+field already stored. `llma schedule install --digest` writes one every Monday morning,
+and `llma serve` has it as a page.
 
 ---
 
@@ -159,7 +189,7 @@ llma search "postgres deadlock" --json     # same results, for a script
 ```
 
 Filters: `--source` (repeatable), `--workspace`, `--participant`, `--host`,
-`--since` / `--until`, `--abandoned`, and three on the matching part itself: `--role`
+`--since` / `--until` (a day, or `7d`, `2w`, `yesterday`, `last-week`), `--abandoned`, and three on the matching part itself: `--role`
 (user, assistant), `--kind` (text, thinking, tool_use, tool_result) and `--tool` (sessions
 that called a given tool). Each hit says where each retriever ranked it before fusion —
 `keyword #3 / semantic #1` — so a surprising position can be traced to the half that
@@ -175,6 +205,8 @@ llma topics                       # the derived topic groups, largest first
 llma search "vlan" --topic packet-tracer-vlan
 llma open 412                     # reopen it: browser, VS Code, or a resumed terminal
 llma open 412 --print             # ... just say where it lives, and open nothing
+llma prime 412                    # the session as a ~12K-char primer for a fresh agent session
+llma prime 412 --chars 6000 -o primer.md
 
 llma who-touched db.py            # the sessions that opened this file
 llma who-touched core/db.py --writes   # ... only the ones that changed it
@@ -183,6 +215,18 @@ llma commands "alembic upgrade"   # every time you ran it, and where
 llma commands -p git --workspace payments-api
 llma blame src/db.py:137          # the commit behind a line, and the session behind that
 llma blame src/db.py -L 120,140   # ... for a range; omit both for the whole file
+
+llma inbox                        # sessions that ended waiting on you
+llma inbox --reason asked-you     # ... only the proposals you never answered
+llma inbox dismiss 412            # done with it (a tag; `restore` undoes it)
+
+llma digest                       # last week: sessions per project, first prompts, files, cost
+llma digest --since 2w --format md --out ./digests/
+
+llma snapshot --label pre-reingest  # a consistent copy, even mid-ingest (also taken before every migration)
+llma snapshot list                # ... prune --keep 3, restore <name>
+llma gc                           # what nothing references any more, and what is merely gone from disk
+llma gc --apply                   # ... reclaim it
 
 llma serve                        # web UI on http://127.0.0.1:8787
 llma serve --no-fetch-images      # ... without the startup image backfill
