@@ -165,9 +165,43 @@ def local_host() -> str:
 PORTABLE = {"claude_code", "codex", "opencode", "vscode_chat"}
 
 
+def _portable_classes() -> dict:
+    from ..adapters.claude_code import ClaudeCodeAdapter
+    from ..adapters.codex import CodexAdapter
+    from ..adapters.opencode import OpenCodeAdapter
+    from ..adapters.vscode_chat import VSCodeChatAdapter
+
+    return {"claude_code": ClaudeCodeAdapter, "codex": CodexAdapter,
+            "opencode": OpenCodeAdapter, "vscode_chat": VSCodeChatAdapter}
+
+
+def machine_adapters(blobs: BlobStore | None, machines: Path,
+                     host: str | None = None) -> list:
+    """One adapter per source per machine filed under `machines` (core/machines.py).
+
+    Each reads its machine's merged tree under that machine's name, which is the whole
+    reason the tree exists: nothing in the files says where they were written. The
+    adapter carries `machine` so a report can say which copy of "Claude Code" it is.
+    """
+    from .machines import listing
+
+    classes = _portable_classes()
+    out = []
+    for machine in listing(machines):
+        if host is not None and machine.host != host:
+            continue
+        for source in machine.sources:
+            adapter = classes[source](root=machine.dir / source, blobs=blobs,
+                                      host=machine.host)
+            adapter.machine = machine.host
+            out.append(adapter)
+    return out
+
+
 def build_adapters(blobs: BlobStore, only: str | None = None,
                    root: Path | None = None, host: str | None = None,
-                   drops: Path | None = None, browser: bool = False) -> list:
+                   drops: Path | None = None, browser: bool = False,
+                   machines: Path | None = None) -> list:
     """Instantiate adapters.
 
     `root` + `host` import a copy taken from a different machine. Since nothing in any
@@ -178,6 +212,9 @@ def build_adapters(blobs: BlobStore, only: str | None = None,
     every drop adapter fell back to its own hard-coded constant pointing at the package's
     own `data/drops` — which meant `--data-dir` moved the database and the blob store
     somewhere else and then read exports from the original tree anyway.
+
+    `machines` adds the trees filed from other machines' bundles, each under its own
+    host. Not with `root`, which names the one tree to read.
     """
     from ..adapters.chatgpt import ChatGPTAdapter
     from ..adapters.claude_code import ClaudeCodeAdapter
@@ -198,8 +235,7 @@ def build_adapters(blobs: BlobStore, only: str | None = None,
     if root is not None:
         if not only:
             raise ValueError("--root requires --source (which tree is this?)")
-        cls = {"claude_code": ClaudeCodeAdapter, "codex": CodexAdapter,
-               "opencode": OpenCodeAdapter, "vscode_chat": VSCodeChatAdapter}.get(only)
+        cls = _portable_classes().get(only)
         if cls is None:
             raise ValueError(f"--root is not supported for source {only!r}; "
                              f"portable sources are {sorted(PORTABLE)}")
@@ -222,6 +258,8 @@ def build_adapters(blobs: BlobStore, only: str | None = None,
         OpenRouterAdapter(blobs=blobs, drops=drops, browser=browser),
         T3ChatAdapter(blobs=blobs, drops=drops),
     ]
+    if machines is not None:
+        all_adapters.extend(machine_adapters(blobs, machines))
     if only:
         return [a for a in all_adapters if a.kind == only]
     return all_adapters
@@ -240,3 +278,17 @@ def drops_dir(root: Path | None = None) -> Path:
     """
     base = root or Path(__file__).resolve().parent.parent.parent / "data"
     return base / "drops"
+
+
+def machines_dir(root: Path | None = None) -> Path:
+    """Where other machines' bundles are merged, one folder per machine."""
+    from .machines import DIRNAME
+
+    base = root or Path(__file__).resolve().parent.parent.parent / "data"
+    return base / DIRNAME
+
+
+def adapter_label(adapter) -> str:
+    """"Claude Code", or "Claude Code @ laptop" for a tree filed from a bundle."""
+    machine = getattr(adapter, "machine", None)
+    return f"{adapter.label} @ {machine}" if machine else adapter.label

@@ -15,6 +15,9 @@ llma ingest --source vscode_chat --root D:/from-laptop/Code/User --host laptop
 it every machine's sessions collapse into one indistinguishable pile in the statistics.
 The command refuses `--root` without it.
 
+That is a one-off read of a folder you copied. For a machine you cannot reach and will
+want sessions from again, use a [bundle](#a-machine-you-cannot-reach-bundles) instead.
+
 ## Some of it is already here
 
 Before copying anything, check what you have. **VS Code stores chats from remote SSH
@@ -32,6 +35,77 @@ BY MACHINE
 
 35 sessions from two other machines, captured without copying a thing. WSL and
 dev-container workspaces are attributed the same way (`wsl:Ubuntu`, `dev-container:…`).
+
+This does **not** extend to Claude Code. Its transcripts are JSONL in `~/.claude/projects`
+on whichever machine ran it, including the VS Code extension over Remote-SSH, which runs
+on the remote. Nothing of it reaches this disk.
+
+## A machine you cannot reach: bundles
+
+No SSH route back — a laptop, a work box, the one Claude Code was tried out on — and
+sessions you will want from it more than once. Pack them there, carry the zip, add it here:
+
+```bash
+llma pack --script E:/            # once: put pack-machine.ps1 on the USB stick
+```
+
+```powershell
+# on the other machine: Windows PowerShell 5.1, nothing to install. Zip lands on the Desktop.
+powershell -ExecutionPolicy Bypass -File pack-machine.ps1
+```
+
+```bash
+llma add E:/llma-machine-laptop-7q2-20261006-1530.zip
+llma machines                     # what each holds, and when its next bundle is due
+```
+
+Where llma is installed on the other machine, `llma pack` there does what the script does.
+
+What makes this more than `--root`:
+
+- **The bundle names its machine.** The packer writes the machine's own hostname into
+  the zip (`llma-machine.json`), so there is nothing to type and nothing to type
+  differently next month. Filed under another name once with `llma add --host`, the
+  machine keeps that name: later bundles find it by the hostname they carry.
+- **It is merged, and kept.** A bundle is merged into `data/machines/<host>/`: new
+  transcripts are added, grown ones replaced, and a transcript the bundle no longer
+  carries is kept. That last rule is the point. Claude Code deletes a transcript 30 days
+  after its last activity by default, so a later bundle has forgotten sessions that the
+  archive must not. Files only move forward in time, so an older bundle found and added
+  late cannot overwrite a newer copy.
+- **Every `llma sync` re-reads it** under its own host, like a local store. The zip
+  itself is not kept; the merged tree is the copy, and `raw_path` points into it.
+- **Only transcripts travel.** The packer reads exactly the files the adapters read
+  (`RULES` in `core/machines.py`): not `.credentials.json`, `auth.json`, Claude's
+  `memory/`, or the rest of those folders, and of `settings.json` only
+  `cleanupPeriodDays`. The unpacker applies the same list, so a zip that carries more
+  still lands only the transcripts. The path rules are written out twice, in Python and
+  in the PowerShell script, and `tests/test_machines.py` runs the script to check that
+  the two still agree.
+
+**When the next one is due.** A week before Claude Code there would start deleting:
+every 23 days at its default retention, and at most every 30 whatever it is set to. The
+nightly sync logs `BUNDLE DUE` for a machine that is late. When retention is at its
+default, the packer says so on the other machine, which is the only place it can be
+changed:
+
+```json
+// ~/.claude/settings.json on the other machine
+{ "cleanupPeriodDays": 365 }
+```
+
+**No script?** Zip the other machine's `.claude` folder by hand and name the machine
+when adding it: `llma add claude.zip --host laptop`. Only `projects/` is read from it,
+but the zip itself then carries `.credentials.json` on whatever it travels on — which
+is what the script exists to avoid.
+
+**This machine's own bundle is refused**, whatever name it is given. Its sessions are
+read live, and a second copy under another host would flip between the two on every
+sync.
+
+The same caution as below applies to how the zip travels. A USB stick is fine. Mailing
+it to yourself is cloud storage under another name, so encrypt it first, as for any
+cloud folder (see R6 below).
 
 ## What to copy
 

@@ -118,6 +118,9 @@ def add_cmd(
                                    help="file the exports but do not read them yet"),
     show_all: bool = typer.Option(False, "--all",
                                   help="also list the files that were not exports"),
+    host: str = typer.Option(None, "--host",
+                             help="machine a zipped .claude folder came from; a bundle "
+                                  "from pack-machine.ps1 names its own"),
     data_dir: Path = typer.Option(None, "--data-dir", help="override data/ location"),
 ) -> None:
     """Take export files into the archive, working out what they are.
@@ -133,13 +136,20 @@ def add_cmd(
 
     Re-adding a file you already have is a no-op: identity is the sha256, so the same
     export downloaded twice under two names is recognised as one.
+
+    A bundle from another machine (`llma pack`, or pack-machine.ps1 where there is no
+    llma) is merged into data/machines/<host>/ and read under that machine's name:
+
+        llma add E:/llma-machine-LAPTOP-7Q2-20261006-1530.zip
+        llma add E:/claude-backup.zip --host laptop     # a zipped .claude folder
     """
-    from .core import intake
+    from .core import intake, machines
 
     con, blobs, db_path = _open(data_dir)
     drops = ingest.drops_dir(data_dir)
+    machines_root = ingest.machines_dir(data_dir)
 
-    taken = intake.take_all(paths, con, drops)
+    taken = intake.take_all(paths, con, drops, machines_root=machines_root, host=host)
     if not taken:
         typer.echo("nothing to look at")
         raise typer.Exit(1)
@@ -159,7 +169,9 @@ def add_cmd(
             typer.echo(f"  {name:<{width}}  {t.kind or '—':<12} {t.action}"
                        f"{'  (' + t.detail + ')' if t.detail else ''}")
 
-    kinds = sorted({t.kind for t in taken if t.ok and t.kind})
+    kinds = sorted({t.kind for t in taken
+                    if t.ok and t.kind and t.kind != machines.KIND})
+    hosts = sorted({t.host for t in taken if t.ok and t.kind == machines.KIND})
     added = sum(1 for t in taken if t.ok)
     failed = [t for t in taken if t.action == "failed"]
 
@@ -172,24 +184,124 @@ def add_cmd(
     if passed_over and not show_all:
         typer.echo("  (--all lists them)")
 
-    if no_ingest or not kinds:
-        if kinds:
+    if no_ingest or not (kinds or hosts):
+        if kinds or hosts:
             typer.echo("not ingested (--no-ingest); run `llma sync` when ready")
         elif not added:
             typer.echo("nothing new to ingest")
         raise typer.Exit(0)
 
-    for kind in kinds:
-        adapters = ingest.build_adapters(blobs, kind, drops=drops,
-                                         browser=idb.is_enabled(con))
-        for adapter in adapters:
-            typer.echo(f"\n=== {adapter.label} ===")
-            _report(ingest.run(adapter, con, blobs))
+    adapters = [adapter for kind in kinds
+                for adapter in ingest.build_adapters(blobs, kind, drops=drops,
+                                                     browser=idb.is_enabled(con))]
+    adapters += [adapter for name in hosts
+                 for adapter in ingest.machine_adapters(blobs, machines_root, host=name)]
+    for adapter in adapters:
+        typer.echo(f"\n=== {ingest.adapter_label(adapter)} ===")
+        _report(ingest.run(adapter, con, blobs))
 
     _report_relink(ingest.relink(con))
 
     typer.echo(f"\n-> {db_path}")
     typer.echo("run `llma index` (or `llma sync`) to make the new sessions searchable")
+
+
+@app.command("pack")
+def pack_cmd(
+    out: Path = typer.Option(Path("."), "--out", "-o",
+                             help="folder to write the bundle into, or a .zip path"),
+    host: str = typer.Option(None, "--host",
+                             help="name to file this machine under (default: its "
+                                  "hostname -- keep it, so every bundle lands together)"),
+    script: Path = typer.Option(None, "--script",
+                                help="instead, write pack-machine.ps1 into this folder, "
+                                     "for a Windows machine without llma"),
+) -> None:
+    """Pack this machine's transcripts into one zip, for `llma add` on another archive.
+
+    For a machine the archive cannot reach over SSH. Carry the zip across -- a USB stick
+    is safest; encrypt it first for mail or a cloud folder -- and on the archive machine:
+
+        llma add llma-machine-laptop-7q2-20261006-1530.zip
+
+    Only what the adapters read goes in: transcripts, never settings or credentials.
+    The machine's hostname goes in too, so every bundle from it lands on one machine.
+
+    Where llma is not installed, `llma pack --script E:/` puts the same packer on a USB
+    stick as a PowerShell script that needs nothing else.
+    """
+    import shutil
+
+    from .core import machines
+
+    if script is not None:
+        dest = script if script.suffix.lower() == ".ps1" else script / "pack-machine.ps1"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(machines.script_path(), dest)
+        typer.echo(f"-> {dest}")
+        typer.echo("on the other machine, from the folder it is in:")
+        typer.echo(f"  powershell -ExecutionPolicy Bypass -File {dest.name}")
+        return
+
+    try:
+        packed = machines.pack(out, host=host)
+    except machines.BundleError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1)
+    for source, count in packed.files.items():
+        typer.echo(f"  {source:<12} {count:>6} file(s)")
+    typer.echo(f"packed {sum(packed.files.values())} file(s), "
+               f"{packed.bytes / 1e6:.1f} MB before compression, as {packed.host}")
+    if "claude_code" in packed.files and packed.cleanup_period_days is None:
+        # Said on the machine that is losing them, because it is the only place where
+        # anything can be done about it.
+        typer.echo(f"\nnote: Claude Code here deletes a transcript "
+                   f"{machines.CLAUDE_CLEANUP_DAYS} days after its last activity. To keep "
+                   f"them until the next bundle,\n      set \"cleanupPeriodDays\": 365 in "
+                   f"~/.claude/settings.json")
+    typer.echo(f"\n-> {packed.path}")
+    typer.echo("then, on the archive machine: llma add <that zip>")
+
+
+@app.command("machines")
+def machines_cmd(data_dir: Path = typer.Option(None, "--data-dir")) -> None:
+    """Machines filed from bundles: when each was packed, what it holds, what is due."""
+    from .core import machines
+
+    con, _, _ = _open(data_dir)
+    root = ingest.machines_dir(data_dir)
+    filed = machines.listing(root)
+    if not filed:
+        typer.echo("no machines filed from bundles yet")
+        typer.echo("  there: llma pack, or pack-machine.ps1 (`llma pack --script <dir>` "
+                   "writes it)\n  here:  llma add <the zip>")
+        raise typer.Exit()
+
+    def day(ms: int | None) -> str:
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d") if ms else "?"
+
+    now = datetime.now().timestamp() * 1000
+    due = {row["host"] for row in machines.due(root)}
+    for machine in filed:
+        age = (now - machine.packed_at) / machines.DAY_MS if machine.packed_at else None
+        next_by = (machine.packed_at + machines.interval_days(machine) * machines.DAY_MS
+                   if machine.packed_at else None)
+        typer.echo(f"\n{machine.host}{'   DUE' if machine.host in due else ''}")
+        typer.echo(f"  last bundle  {day(machine.packed_at)}"
+                   + (f" ({age:.0f}d ago)" if age is not None else "")
+                   + f" · {machine.bundles} bundle(s) · next by {day(next_by)}")
+        files = {source: sum(1 for p in (machine.dir / source).rglob("*") if p.is_file())
+                 for source in machine.sources}
+        typer.echo("  files        " + " · ".join(f"{s} {n}" for s, n in files.items()))
+        row = con.execute("SELECT COUNT(*) n, MAX(started_at) newest FROM session "
+                          "WHERE host=?", (machine.host,)).fetchone()
+        typer.echo(f"  sessions     {row['n']} in the archive"
+                   + (f", newest {day(row['newest'])}" if row["newest"] else ""))
+        if "claude_code" in machine.sources:
+            keep = machine.cleanup_period_days or machines.CLAUDE_CLEANUP_DAYS
+            typer.echo(f"  retention    Claude Code there keeps a transcript {keep}d "
+                       f"after its last activity"
+                       + ("" if machine.cleanup_period_days else " (its default)"))
 
 
 @app.command("browser")
@@ -266,6 +378,10 @@ def ingest_cmd(
 
     Nothing in these formats records a hostname, so --host is the only thing keeping
     three machines' sessions apart in the statistics.
+
+    That is a one-off read of a folder outside the archive. For a machine you will be
+    bringing sessions from again, `llma add` its bundle instead (see `llma pack`): the
+    bundle names its machine, is merged under data/machines/, and every sync re-reads it.
     """
     con, blobs, db_path = _open(data_dir)
     if root is not None and not root.exists():
@@ -278,7 +394,8 @@ def ingest_cmd(
     try:
         adapters = ingest.build_adapters(blobs, source, root=root, host=host,
                                          drops=ingest.drops_dir(data_dir),
-                                         browser=browser or idb.is_enabled(con))
+                                         browser=browser or idb.is_enabled(con),
+                                         machines=ingest.machines_dir(data_dir))
     except ValueError as exc:
         typer.echo(str(exc))
         raise typer.Exit(1)
@@ -289,7 +406,7 @@ def ingest_cmd(
         typer.echo(f"importing {source} from {root}  (host={host})")
 
     for adapter in adapters:
-        typer.echo(f"\n=== {adapter.label} ===")
+        typer.echo(f"\n=== {ingest.adapter_label(adapter)} ===")
         _report(ingest.run(adapter, con, blobs, force=force))
 
     _report_relink(ingest.relink(con))
@@ -1330,6 +1447,11 @@ def sync(
         typer.echo(f"\n{len(res.stale_exports)} export(s) need you:")
         for row in res.stale_exports:
             typer.echo(f"  {row['label']:16} {row['reason']}")
+            typer.echo(f"  {'':16} {row['how']}")
+    if res.stale_machines:
+        typer.echo(f"\n{len(res.stale_machines)} machine bundle(s) due:")
+        for row in res.stale_machines:
+            typer.echo(f"  {row['host']:16} {row['reason']}")
             typer.echo(f"  {'':16} {row['how']}")
 
 

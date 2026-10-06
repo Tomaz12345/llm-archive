@@ -965,15 +965,16 @@ def create_app(data_dir: Path | None = None, *,
         `intake.identify` reads ZIP members and needs a real file rather than a stream.
         Nothing is copied into drops/ until it has been recognised as something.
         """
-        from ..core import intake
+        from ..core import intake, machines
 
         con = connect()
         blobs = BlobStore(blob_dir)
         drops = ingest.drops_dir(data_dir)
+        machines_root = ingest.machines_dir(data_dir)
         staging = drops / intake.STAGING
         staging.mkdir(parents=True, exist_ok=True)
 
-        taken, kinds = [], set()
+        taken, kinds, hosts = [], set(), set()
         try:
             for item in upload:
                 if not item.filename:
@@ -994,10 +995,12 @@ def create_app(data_dir: Path | None = None, *,
                         detail=f"over the {MAX_UPLOAD_BYTES // (1 << 20)} MB limit"))
                     continue
 
-                result = intake.take(temp, con, drops)
+                result = intake.take(temp, con, drops, machines_root=machines_root)
                 result.source = Path(item.filename)   # report the name they uploaded
                 taken.append(result)
-                if result.ok and result.kind:
+                if result.ok and result.kind == machines.KIND:
+                    hosts.add(result.host)
+                elif result.ok and result.kind:
                     kinds.add(result.kind)
                 temp.unlink(missing_ok=True)
             con.commit()
@@ -1005,12 +1008,16 @@ def create_app(data_dir: Path | None = None, *,
             for leftover in staging.glob("*"):
                 leftover.unlink(missing_ok=True)
 
+        adapters = [adapter for kind in sorted(kinds)
+                    for adapter in ingest.build_adapters(blobs, kind, drops=drops,
+                                                         browser=idb.is_enabled(con))]
+        adapters += [adapter for name in sorted(hosts)
+                     for adapter in ingest.machine_adapters(blobs, machines_root,
+                                                            host=name)]
         results = []
-        for kind in sorted(kinds):
-            for adapter in ingest.build_adapters(blobs, kind, drops=drops,
-                                                 browser=idb.is_enabled(con)):
-                res = ingest.run(adapter, con, blobs)
-                results.append({"label": adapter.label, "r": res})
+        for adapter in adapters:
+            res = ingest.run(adapter, con, blobs)
+            results.append({"label": ingest.adapter_label(adapter), "r": res})
 
         return import_page(request, con, taken=taken, results=results)
 

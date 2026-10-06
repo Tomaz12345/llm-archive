@@ -136,6 +136,8 @@ class SyncResult:
     # Bulk sources that need re-exporting. Carried on the result, not just logged, so
     # the caller can surface it — `llma sync` prints it, and a notifier could too.
     stale_exports: list = field(default_factory=list)
+    # Machines filed from bundles whose last one is older than their interval.
+    stale_machines: list = field(default_factory=list)
 
     @property
     def new(self) -> int:
@@ -212,6 +214,26 @@ def _report_freshness(con, log: Callable[[str], None]) -> list[dict]:
     return needs
 
 
+def _report_machines(machines: Path, log: Callable[[str], None]) -> list[dict]:
+    """Name the machines whose bundle is due, the same way an overdue export is named.
+
+    A machine's store is a bulk export with a deadline attached: Claude Code there
+    deletes what this archive has not yet been given, so a missed bundle is history
+    lost rather than history late.
+    """
+    from . import machines as machine_store
+
+    try:
+        rows = machine_store.due(machines)
+    except Exception as exc:                            # noqa: BLE001
+        log(f"  machine check failed — {type(exc).__name__}: {exc}")
+        return []
+    for row in rows:
+        log(f"  BUNDLE DUE  {row['host']}: {row['reason']}")
+        log(f"              {row['how']}")
+    return rows
+
+
 def run(data_dir: Path | None = None, with_vectors: bool = True,
         log: Callable[[str], None] = print) -> SyncResult:
     """Ingest everything discoverable on this machine, then rebuild the indexes."""
@@ -224,6 +246,7 @@ def run(data_dir: Path | None = None, with_vectors: bool = True,
 
     t0 = time.perf_counter()
     db_path, blob_dir = ingest.default_paths(data_dir)
+    machines = ingest.machines_dir(data_dir)
     result = SyncResult(skipped_vectors=not with_vectors)
 
     with Lock(db_path.parent / LOCK_NAME):
@@ -232,18 +255,19 @@ def run(data_dir: Path | None = None, with_vectors: bool = True,
 
         for adapter in ingest.build_adapters(
                 blobs, drops=ingest.drops_dir(data_dir),
-                browser=idb.is_enabled(con)):
+                browser=idb.is_enabled(con), machines=machines):
             # An adapter that throws must not take the other eleven with it: this runs
             # unattended, so the failure mode to avoid is one drifted format (§8.5)
             # stopping the archive updating at all, with only a log file to say why.
+            where = f" @ {adapter.machine}" if getattr(adapter, "machine", None) else ""
             try:
                 res = ingest.run(adapter, con, blobs)
             except Exception as exc:                        # noqa: BLE001
-                log(f"  {adapter.kind}: FAILED — {type(exc).__name__}: {exc}")
+                log(f"  {adapter.kind}{where}: FAILED — {type(exc).__name__}: {exc}")
                 continue
-            result.ingested.append((adapter.label, res))
+            result.ingested.append((ingest.adapter_label(adapter), res))
             if res.new or res.updated:
-                log(f"  {adapter.kind}: +{res.new} new, {res.updated} updated, "
+                log(f"  {adapter.kind}{where}: +{res.new} new, {res.updated} updated, "
                     f"{res.skipped} unchanged")
 
         # "Nothing was ingested" is not the same as "the index is fine". A build killed
@@ -285,6 +309,7 @@ def run(data_dir: Path | None = None, with_vectors: bool = True,
         # Activity deletes on a rolling window and Grok's bundle sits behind a 30-day
         # TTL, so "you have three weeks left" is worth saying while it is still true.
         result.stale_exports = _report_freshness(con, log)
+        result.stale_machines = _report_machines(machines, log)
 
         con.close()
 

@@ -99,8 +99,13 @@ with assets bundled. Secrets are redacted by default on the way out.
 output and replaces them with `[redacted:<rule>:<hash>]` — so you can still tell which key
 leaked without keeping the plaintext. Opt in to run it on every ingest.
 
-**Multi-machine.** Copy another machine's store here and tag it with `--host`; nothing in
-these formats records a hostname, so without it three laptops collapse into one pile.
+**Multi-machine.** Nothing in these formats records a hostname, so without one three
+laptops collapse into one pile. A machine the archive cannot reach packs its own
+transcripts into a zip that names it — `pack-machine.ps1` needs nothing installed there
+— and `llma add` merges that into `data/machines/<host>/`, where every sync re-reads it.
+Merged, not replaced: a session Claude Code's 30-day cleanup has since deleted on that
+machine stays here, and the nightly sync says when a machine's next bundle is due. Only
+transcripts travel; credentials and settings are never packed.
 
 **Stays current on its own.** `llma schedule install` registers a nightly re-ingest and
 re-index; `llma freshness` tells you which web exports have gone stale.
@@ -172,6 +177,14 @@ llma add ~/Downloads/conversations-000.zip
 
 Re-adding a file you already have does nothing; identity is the sha256. Which export to
 request from where is in [docs/export-requests.md](docs/export-requests.md).
+
+Another machine's agent sessions come in the same way, as a bundle packed there:
+
+```bash
+llma pack --script E:/            # pack-machine.ps1 onto a USB stick, for a machine without llma
+llma add E:/llma-machine-laptop-7q2-20261006-1530.zip   # merged under that machine's name
+llma machines                     # each machine: last bundle, what it holds, when the next is due
+```
 
 ### 2. Index and search
 
@@ -272,6 +285,7 @@ llma stats                        # what's in the archive
 | `llma lineage` | re-detect resumed sessions that replay an earlier transcript |
 | `llma validate` | check the message DAG for structural corruption |
 | `llma doctor` | report record types no adapter handled |
+| `llma pack` | bundle this machine's transcripts for another archive's `llma add`; `--script` writes the no-install PowerShell packer |
 | `llma browser` | opt-in: read OpenRouter's chats from its own browser IndexedDB store |
 | `llma fetch-images` | download images archived as a URL only; `llma serve` also does this at startup |
 
@@ -302,6 +316,6 @@ same judgement applies as to pasting a transcript into a chat.
 
 ```bash
 uv pip install -e ".[web,embed,dev]"
-pytest        # 814 tests, all offline — every fixture is inline; blame builds a git repo in tmp
+pytest        # 928 tests, all offline — every fixture is inline; blame builds a git repo in tmp
 ruff check .
 ```

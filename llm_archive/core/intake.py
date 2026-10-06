@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import machines
+
 READ_CHUNK = 1 << 20
 
 # Where a consumed drop goes, under the drops folder itself: the raw bytes stay beside
@@ -70,6 +72,7 @@ class Taken:
     detail: str = ""
     dest: Path | None = None
     sha: str | None = None
+    host: str | None = None   # a machine bundle: the machine it was filed under
 
     @property
     def ok(self) -> bool:
@@ -142,6 +145,10 @@ def identify(path: Path) -> str | None:
         suffix = path.suffix.lower()
         if suffix in SKIP_SUFFIXES or suffix not in EXPORT_SUFFIXES:
             return None
+    # Asked first: a zipped `.claude` folder is no web export, and every drop adapter
+    # would otherwise open it to look for its own file among a few hundred transcripts.
+    if machines.inspect(path) is not None:
+        return machines.KIND
     for cls in drop_adapters():
         try:
             if cls.claims(path):
@@ -276,17 +283,25 @@ def _free_name(drops: Path, name: str) -> Path:
     return drops / f"{stem}-{int(time.time())}{suffix}"
 
 
-def take(path: Path, con: sqlite3.Connection, drops: Path) -> Taken:
-    """Identify one file and, if it is an export, copy it into the drops folder."""
+def take(path: Path, con: sqlite3.Connection, drops: Path,
+         machines_root: Path | None = None, host: str | None = None) -> Taken:
+    """Identify one file and, if it is an export, copy it into the drops folder.
+
+    A machine bundle is not copied but merged into `machines_root` (beside `drops` when
+    not given), under `host` if one is given -- see core/machines.py.
+    """
     result = Taken(source=path)
     try:
         if not path.exists():
             result.action, result.detail = "failed", "no such file"
             return result
-        size = (sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
-                if path.is_dir() else path.stat().st_size)
         kind = identify(path)
-        sha = content_id(path)
+        if kind == machines.KIND and path.is_dir():
+            sha, size = machines.tree_id(path)
+        else:
+            size = (sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+                    if path.is_dir() else path.stat().st_size)
+            sha = content_id(path)
     except OSError as exc:
         result.action, result.detail = "failed", f"unreadable: {exc.strerror or exc}"
         return result
@@ -303,6 +318,8 @@ def take(path: Path, con: sqlite3.Connection, drops: Path) -> Taken:
             # would claim the archive took something it deliberately did not.
             result.action = "skipped"
             result.detail = "not an export"
+        elif prior["kind"] == machines.KIND:
+            result.detail = "already merged"
         elif prior["ingested_at"]:
             result.detail = "already ingested"
         else:
@@ -315,6 +332,10 @@ def take(path: Path, con: sqlite3.Connection, drops: Path) -> Taken:
                origin=str(path))
         result.action, result.detail = "skipped", "not an export"
         return result
+
+    if kind == machines.KIND:
+        return _take_bundle(result, path, con, size, machines_root or
+                            drops.parent / machines.DIRNAME, host)
 
     drops.mkdir(parents=True, exist_ok=True)
 
@@ -356,8 +377,35 @@ def take(path: Path, con: sqlite3.Connection, drops: Path) -> Taken:
     return result
 
 
-def take_all(paths, con: sqlite3.Connection, drops: Path) -> list[Taken]:
-    results = [take(path, con, drops) for path in expand(paths)]
+def _take_bundle(result: Taken, path: Path, con: sqlite3.Connection, size: int,
+                 machines_root: Path, host: str | None) -> Taken:
+    """Merge a machine bundle into its machine's tree and remember having done so.
+
+    The bundle itself is not kept: the merged tree is the copy, and a zip of the same
+    few hundred transcripts every month would be the same bytes stored again each time.
+    Its ledger row points at the machine's folder, which is where its content went.
+    A bundle that cannot be filed -- a bare store with no name -- is not recorded, so
+    the same file is looked at again once there is a `--host` to go with it.
+    """
+    try:
+        merged = machines.unpack(path, machines_root, host=host)
+    except machines.BundleError as exc:
+        result.action, result.detail = "failed", str(exc)
+        return result
+    except OSError as exc:
+        result.action, result.detail = "failed", f"unreadable: {exc.strerror or exc}"
+        return result
+    record(con, result.sha, path.name, machines.KIND, size, merged.packed_at,
+           merged.dir, origin=str(path))
+    result.action, result.dest, result.host = "added", merged.dir, merged.host
+    result.detail = merged.describe()
+    return result
+
+
+def take_all(paths, con: sqlite3.Connection, drops: Path,
+             machines_root: Path | None = None, host: str | None = None) -> list[Taken]:
+    results = [take(path, con, drops, machines_root=machines_root, host=host)
+               for path in expand(paths)]
     con.commit()
     return results
 
