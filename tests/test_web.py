@@ -160,6 +160,34 @@ def test_uploading_an_export_identifies_and_ingests_it(client, tmp_path):
     assert "Uploaded chat" in client.get("/browse?source=claude_web").text
 
 
+def test_uploading_a_machine_bundle_files_it_under_its_machine(client, tmp_path):
+    """The import page takes a bundle from pack-machine.ps1 the way `llma add` does."""
+    import io
+    import zipfile
+
+    rec = {"type": "user", "uuid": "u1", "parentUuid": None,
+           "timestamp": "2026-09-01T10:00:00Z", "cwd": "C:\\Users\\x\\demo",
+           "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("llma-machine.json", json.dumps({
+            "format": "llma-machine-bundle", "version": 1, "host": "LAPTOP-7Q2",
+            "packed_at": "2026-10-06T12:00:00Z", "sources": {}}))
+        zf.writestr("claude_code/projects/p/s9.jsonl", json.dumps(rec) + "\n")
+
+    r = client.post("/import", files={
+        "upload": ("llma-machine-laptop-7q2.zip", buf.getvalue(), "application/zip")})
+
+    assert r.status_code == 200
+    assert "Claude Code @ LAPTOP-7Q2" in r.text
+    con = db.connect(tmp_path / "data" / "archive.db")
+    assert con.execute("SELECT host FROM session WHERE native_id='s9'").fetchone()["host"] \
+        == "LAPTOP-7Q2"
+    con.close()
+    assert (tmp_path / "data" / "machines" / "laptop-7q2" / "claude_code" / "projects"
+            / "p" / "s9.jsonl").exists()
+
+
 def test_uploading_a_non_export_is_reported_not_ingested(client):
     r = client.post("/import", files={
         "upload": ("holiday.mp4", b"\x00\x00\x00 ftypisom", "video/mp4")})

@@ -400,6 +400,46 @@ def test_a_long_retention_still_wants_a_bundle_monthly(tmp_path):
     assert machines.interval_days(machines.listing(root)[0]) == 30
 
 
+# -- the nightly sync ------------------------------------------------------
+
+
+def test_the_nightly_sync_reads_a_filed_machine_and_names_a_late_one(tmp_path, monkeypatch):
+    """The scheduled task is the only reader most bundles will ever get."""
+    from llm_archive.core import sync
+
+    data = tmp_path / "data"
+    db.connect(data / "archive.db").close()
+    machines.unpack(bundle_zip(tmp_path / "a.zip", manifest(packed_at="2020-01-01T00:00:00Z"),
+                               {"claude_code/projects/p/s1.jsonl": transcript(2)}),
+                    ingest.machines_dir(data))
+
+    # Only the filed machine: the live stores here belong to whoever runs the tests.
+    seen = {}
+
+    def filed_only(blobs, *args, machines=None, **kwargs):
+        assert machines is not None, "sync must hand build_adapters the machines folder"
+        seen["machines"] = machines
+        return ingest.machine_adapters(blobs, machines)
+
+    monkeypatch.setattr(ingest, "build_adapters", filed_only)
+
+    lines: list[str] = []
+    res = sync.run(data, with_vectors=False, log=lines.append)
+
+    assert seen["machines"] == ingest.machines_dir(data)
+    assert res.new == 1
+    con = db.connect(data / "archive.db")
+    assert [r["host"] for r in con.execute("SELECT host FROM session")] == ["LAPTOP-7Q2"]
+    con.close()
+    assert "  claude_code @ LAPTOP-7Q2: +1 new, 0 updated, 0 unchanged" in lines
+    assert [r["host"] for r in res.stale_machines] == ["LAPTOP-7Q2"]
+    assert any(line.startswith("  BUNDLE DUE  LAPTOP-7Q2: last bundle packed")
+               for line in lines)
+
+    again = sync.run(data, with_vectors=False, log=lambda _: None)
+    assert (again.new, again.updated) == (0, 0), "an unchanged tree is skipped, not re-read"
+
+
 # -- the CLI and the PowerShell packer -------------------------------------
 
 

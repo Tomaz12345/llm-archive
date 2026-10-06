@@ -316,6 +316,6 @@ same judgement applies as to pasting a transcript into a chat.
 
 ```bash
 uv pip install -e ".[web,embed,dev]"
-pytest        # 928 tests, all offline — every fixture is inline; blame builds a git repo in tmp
+pytest        # 930 tests, all offline — every fixture is inline; blame builds a git repo in tmp
 ruff check .
 ```
